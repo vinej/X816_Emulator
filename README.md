@@ -1,3 +1,41 @@
+> ## This is the X816 emulator, not the Commander X16 emulator
+>
+> **X816** is a different machine: a flat **16 MB, native-mode-only 65C816**
+> MiSTer core. It has no bank latches, no `$A000-$BFFF` window and no KERNAL, so
+> **no Commander X16 software runs on it.** What it keeps from the X16 is the
+> *hardware* — VERA, the YM2151, two 6522 VIAs and the SMC keyboard path — and
+> the I/O page layout at `$00:9Fxx`, which is byte-for-byte identical so that
+> register offsets and drivers port over unchanged.
+>
+> This repository starts as an exact copy of
+> [X16Community/x16-emulator](https://github.com/X16Community/x16-emulator)
+> at commit `77f2bab`, with its full history retained for attribution and
+> `git blame`. It is **not** a GitHub fork: no upstream sync and no pull
+> requests back are intended, because the memory subsystem is being replaced
+> outright rather than extended.
+>
+> Original work Copyright (c) 2019 Michael Steil and the X16Community
+> contributors, under the 2-clause BSD licence in [LICENSE](./LICENSE), which is
+> retained unchanged.
+>
+> The FPGA core lives in a separate repository (not yet published). Its
+> `doc/MEMORY_MAP.md` is the authority for the address map this emulator must
+> reproduce.
+>
+> ### Planned changes
+>
+> | Area | Action |
+> |---|---|
+> | `src/cpu/` | **keep** — already a real 65816 with native mode, 16-bit registers, DBR/PBR |
+> | `src/memory.c` / `.h` | **rewrite** — flat 24-bit map; drop the `$0000`/`$0001` bank latches, the HiRAM window and the banked ROM |
+> | `video.c`, `via.c`, `ymglue.cpp`, `smc.c`, `i2c.c`, `sdcard.c`, `audio.c` | **keep** |
+> | `cartridge.c`, `makecart.c`, `ieee.c`, `midi.c` | **drop** — X16-only |
+> | `debugger.c`, `disasm.c` | keep; strip the KERNAL/ROM-symbol awareness |
+>
+> The emulator's VERA configuration must track the RTL core exactly. A mismatch
+> is worse than having no emulator, because software developed against one would
+> silently break on the other.
+
 <p align="center">
   <img src="./.gh/logo.png" />
 </p>
