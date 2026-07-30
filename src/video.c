@@ -123,7 +123,6 @@ static uint8_t io_dcsel;
 // All power up to 0, which makes VERA816 behave exactly like stock VERA until
 // software opts in. See the core's doc/VERA816.md section 4.
 #define VERA816_DCSEL 32
-static uint8_t vera816_addrx;      // [1:0] ADDR0[18:17], [3:2] ADDR1[18:17]
 static uint8_t vera816_basex[2];   // per layer: [1:0] MAPBASE[9:8], [3:2] TILEBASE[9:8]
 
 static uint8_t ien;
@@ -244,7 +243,6 @@ video_reset()
 	memset(io_inc, 0, sizeof(io_inc));
 	io_addrsel = 0;
 	io_dcsel = 0;
-	vera816_addrx = 0;
 	vera816_basex[0] = 0;
 	vera816_basex[1] = 0;
 	io_rddata[0] = 0;
@@ -2059,7 +2057,13 @@ uint8_t video_read(uint8_t reg, bool debugOn) {
 			// VERA, so software can detect the extension.
 			if (io_dcsel == VERA816_DCSEL) {
 				switch (reg) {
-					case 0x09: return vera816_addrx;
+					// ADDRX is a live WINDOW onto ADDR0/ADDR1 bits 18:17, not a
+					// separate latch -- so it tracks auto-increment carry, and
+					// reading it after the address has advanced returns the
+					// current bits. The RTL gets this for free because the bits
+					// live in the address registers; here it has to be derived.
+					case 0x09: return (uint8_t)(((io_addr[0] >> 17) & 0x03)
+					                          | (((io_addr[1] >> 17) & 0x03) << 2));
 					case 0x0A: return vera816_basex[0];
 					case 0x0B: return vera816_basex[1];
 					case 0x0C: return VERA816_VRAMCAP;
@@ -2288,7 +2292,6 @@ void video_write(uint8_t reg, uint8_t value) {
 			if (io_dcsel == VERA816_DCSEL) {
 				switch (reg) {
 					case 0x09:  // $9F29 ADDRX
-						vera816_addrx = value & 0x0f;
 						// Re-apply to both address registers immediately, so
 						// the order of ADDRX vs ADDR_L/M/H writes does not
 						// matter to software.
