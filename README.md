@@ -18,9 +18,9 @@
 > contributors, under the 2-clause BSD licence in [LICENSE](./LICENSE), which is
 > retained unchanged.
 >
-> The FPGA core lives in a separate repository (not yet published). Its
-> `doc/MEMORY_MAP.md` is the authority for the address map this emulator must
-> reproduce.
+> FPGA core: <https://github.com/vinej/X816_Core>. Its
+> [`doc/MEMORY_MAP.md`](https://github.com/vinej/X816_Core/blob/main/doc/MEMORY_MAP.md)
+> is the authority for the address map this emulator must reproduce.
 >
 > ### Planned changes
 >
