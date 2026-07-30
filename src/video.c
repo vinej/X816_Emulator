@@ -44,7 +44,14 @@
 #define VERA_VERSION_PATCH  2
 
 #define ADDR_VRAM_START     0x00000
-#define ADDR_VRAM_END       0x20000
+// VERA816: 19-bit address space (512 KB), 352 KB populated.
+// See the core's doc/VERA816.md -- that document is the contract, and the
+// RTL implements the same numbers.
+#define VERA816_VRAM_SIZE   0x58000   // 352 KB populated
+#define VERA816_ADDR_MASK   0x7FFFF   // 19-bit address space
+#define VERA816_VRAMCAP     (VERA816_VRAM_SIZE / 0x4000)  // 22, in 16 KB units
+
+#define ADDR_VRAM_END       VERA816_VRAM_SIZE
 #define ADDR_PSG_START      0x1F9C0
 #define ADDR_PSG_END        0x1FA00
 #define ADDR_PALETTE_START  0x1FA00
@@ -97,7 +104,7 @@ bool mouse_grabbed = false;
 bool no_keyboard_capture = false;
 bool kernal_mouse_enabled = false;
 
-static uint8_t video_ram[0x20000];
+static uint8_t video_ram[VERA816_VRAM_SIZE];
 static uint8_t palette[256 * 2];
 static uint8_t sprite_data[128][8];
 
@@ -107,6 +114,17 @@ static uint8_t io_rddata[2];
 static uint8_t io_inc[2];
 static uint8_t io_addrsel;
 static uint8_t io_dcsel;
+
+// VERA816 extension bank, DCSEL=32. Stock VERA has no spare bits for two more
+// address bits, and $9F3D is not free (it is write-only AUDIO_DATA), so the
+// extensions live in an otherwise-unused DCSEL bank. DCSEL 0-1 are display
+// control, 2-6 are VERA FX and 63 is the version registers (DC_VER0-3), so 32
+// is used -- clear of both, with room either side.
+// All power up to 0, which makes VERA816 behave exactly like stock VERA until
+// software opts in. See the core's doc/VERA816.md section 4.
+#define VERA816_DCSEL 32
+static uint8_t vera816_addrx;      // [1:0] ADDR0[18:17], [3:2] ADDR1[18:17]
+static uint8_t vera816_basex[2];   // per layer: [1:0] MAPBASE[9:8], [3:2] TILEBASE[9:8]
 
 static uint8_t ien;
 static uint8_t isr;
@@ -226,6 +244,9 @@ video_reset()
 	memset(io_inc, 0, sizeof(io_inc));
 	io_addrsel = 0;
 	io_dcsel = 0;
+	vera816_addrx = 0;
+	vera816_basex[0] = 0;
+	vera816_basex[1] = 0;
 	io_rddata[0] = 0;
 	io_rddata[1] = 0;
 
@@ -463,8 +484,14 @@ refresh_layer_properties(const uint8_t layer)
 	uint16_t prev_hscroll = props->hscroll;
 
 	props->color_depth    = reg_layer[layer][0] & 0x3;
-	props->map_base       = reg_layer[layer][1] << 9;
-	props->tile_base      = (reg_layer[layer][2] & 0xFC) << 9;
+	// VERA816: MAPBASE and TILEBASE each gain two bits from the DCSEL=63
+	// extension bank, extending their reach from a 17-bit to a 19-bit space.
+	// Granularity is unchanged -- MAPBASE stays 512-byte aligned, TILEBASE
+	// 2048-byte aligned.
+	props->map_base       = (reg_layer[layer][1] << 9)
+	                      | ((uint32_t)(vera816_basex[layer] & 0x03) << 17);
+	props->tile_base      = ((reg_layer[layer][2] & 0xFC) << 9)
+	                      | ((uint32_t)((vera816_basex[layer] >> 2) & 0x03) << 17);
 	props->bitmap_mode    = (reg_layer[layer][0] & 0x4) != 0;
 	props->text_mode      = (props->color_depth == 0) && !props->bitmap_mode;
 	props->text_mode_256c = (reg_layer[layer][0] & 8) != 0;
@@ -1607,6 +1634,11 @@ get_and_inc_address(uint8_t sel, bool write)
 	}
 
 	io_addr[sel] += incr;
+	// VERA816: the address space is 19 bits and auto-increment wraps within
+	// it (doc/VERA816.md conformance test 4). Stock VERA masked only at
+	// access time, which let the register read back a value it could never
+	// address.
+	io_addr[sel] &= VERA816_ADDR_MASK;
 
 	if (sel == 1 && fx_addr1_mode == 1) { // FX line draw mode
 		fx_x_pixel_position += fx_x_pixel_increment;
@@ -1683,10 +1715,29 @@ fx_affine_prefetch(void)
 // Vera: Internal Video Address Space
 //
 
+// Maps a VERA816 address onto storage. The address space is 19 bits but only
+// 352 KB is populated; $58000-$7FFFF has no memory behind it, and per
+// doc/VERA816.md reads there return $00 and writes are discarded, with no
+// mirroring (352 KB is not a power of two, so mirroring would need a modulo).
+// Routing the hole to a sink byte that is cleared on every access gives those
+// semantics uniformly, including for the read-modify-write FX paths.
+static uint8_t vram_hole_sink;
+
+static inline uint8_t *
+vram_at(uint32_t address)
+{
+	address &= VERA816_ADDR_MASK;
+	if (address >= VERA816_VRAM_SIZE) {
+		vram_hole_sink = 0;
+		return &vram_hole_sink;
+	}
+	return &video_ram[address];
+}
+
 uint8_t
 video_space_read(uint32_t address)
 {
-	return video_ram[address & 0x1FFFF];
+	return (*vram_at(address));
 }
 
 static void
@@ -1704,7 +1755,7 @@ video_space_read_range(uint8_t* dest, uint32_t address, uint32_t size)
 void
 video_space_write(uint32_t address, uint8_t value)
 {
-	video_ram[address & 0x1FFFF] = value;
+	(*vram_at(address)) = value;
 
 	if (address >= ADDR_PSG_START && address < ADDR_PSG_END) {
 		audio_render();
@@ -1725,15 +1776,15 @@ fx_video_space_write(uint32_t address, bool nibble, uint8_t value)
 	if (fx_4bit_mode) {
 		if (nibble) {
 			if (!fx_trans_writes || (value & 0x0f) > 0) {
-				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0xf0) | (value & 0x0f);
+				(*vram_at(address)) = ((*vram_at(address)) & 0xf0) | (value & 0x0f);
 			}
 		} else {
 			if (!fx_trans_writes || (value & 0xf0) > 0) {
-				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0x0f) | (value & 0xf0);
+				(*vram_at(address)) = ((*vram_at(address)) & 0x0f) | (value & 0xf0);
 			}
 		}
 	} else {
-		if (!fx_trans_writes || value > 0) video_ram[address & 0x1FFFF] = value;
+		if (!fx_trans_writes || value > 0) (*vram_at(address)) = value;
 	}
 	if (address >= ADDR_PSG_START && address < ADDR_PSG_END) {
 		audio_render();
@@ -1753,13 +1804,13 @@ fx_vram_cache_write(uint32_t address, uint8_t value, uint8_t mask)
 	if (!fx_trans_writes || value > 0) {
 		switch (mask) {
 			case 0:
-				video_ram[address & 0x1FFFF] = value;
+				(*vram_at(address)) = value;
 				break;
 			case 1:
-				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0x0f) | (value & 0xf0);
+				(*vram_at(address)) = ((*vram_at(address)) & 0x0f) | (value & 0xf0);
 				break;
 			case 2:
-				video_ram[address & 0x1FFFF] = (video_ram[address & 0x1FFFF] & 0xf0) | (value & 0x0f);
+				(*vram_at(address)) = ((*vram_at(address)) & 0xf0) | (value & 0x0f);
 				break;
 			case 3:
 				// Do nothing
@@ -1949,7 +2000,7 @@ uint8_t video_read(uint8_t reg, bool debugOn) {
 	switch (reg & 0x1F) {
 		case 0x00: return io_addr[io_addrsel] & 0xff;
 		case 0x01: return (io_addr[io_addrsel] >> 8) & 0xff;
-		case 0x02: return (io_addr[io_addrsel] >> 16) | (fx_nibble_bit[io_addrsel] << 1) | (fx_nibble_incr[io_addrsel] << 2) | (io_inc[io_addrsel] << 3);
+		case 0x02: return ((io_addr[io_addrsel] >> 16) & 1) | (fx_nibble_bit[io_addrsel] << 1) | (fx_nibble_incr[io_addrsel] << 2) | (io_inc[io_addrsel] << 3);
 		case 0x03:
 		case 0x04: {
 			if (debugOn) {
@@ -2002,6 +2053,19 @@ uint8_t video_read(uint8_t reg, bool debugOn) {
 		case 0x0B:
 		case 0x0C: {
 			int i = reg - 0x09 + (io_dcsel << 2);
+
+			// VERA816 extension bank (doc/VERA816.md section 4.1). VRAMCAP
+			// reports populated VRAM in 16 KB units and reads 0 on stock
+			// VERA, so software can detect the extension.
+			if (io_dcsel == VERA816_DCSEL) {
+				switch (reg) {
+					case 0x09: return vera816_addrx;
+					case 0x0A: return vera816_basex[0];
+					case 0x0B: return vera816_basex[1];
+					case 0x0C: return VERA816_VRAMCAP;
+				}
+			}
+
 			if (debugOn) return video_get_dc_value(i);
 			switch (i) {
 				case 0x00:
@@ -2079,18 +2143,18 @@ void video_write(uint8_t reg, uint8_t value) {
 				fx_2bit_poking = true;
 				io_addr[1] = (io_addr[1] & 0x1fffc) | (value & 0x3);
 			} else {
-				io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x1ff00) | value;
+				io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x7ff00) | value;
 				if (fx_16bit_hop && io_addrsel == 1)
 					fx_16bit_hop_align = value & 3;
 			}
 			io_rddata[io_addrsel] = video_space_read(io_addr[io_addrsel]);
 			break;
 		case 0x01:
-			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x100ff) | (value << 8);
+			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x700ff) | (value << 8);
 			io_rddata[io_addrsel] = video_space_read(io_addr[io_addrsel]);
 			break;
 		case 0x02:
-			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x0ffff) | ((value & 0x1) << 16);
+			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x6ffff) | ((value & 0x1) << 16);
 			fx_nibble_bit[io_addrsel] = (value >> 1) & 0x1;
 			fx_nibble_incr[io_addrsel] = (value >> 2) & 0x1;
 			io_inc[io_addrsel]  = value >> 3;
@@ -2103,16 +2167,16 @@ void video_write(uint8_t reg, uint8_t value) {
 				uint8_t mask = value >> 6;
 				switch (mask) {
 					case 0x00:
-						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0xc0) | (io_rddata[1] & 0x3f);
+						(*vram_at(io_addr[1])) = (fx_cache[fx_cache_byte_index] & 0xc0) | (io_rddata[1] & 0x3f);
 						break;
 					case 0x01:
-						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0x30) | (io_rddata[1] & 0xcf);
+						(*vram_at(io_addr[1])) = (fx_cache[fx_cache_byte_index] & 0x30) | (io_rddata[1] & 0xcf);
 						break;
 					case 0x02:
-						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0x0c) | (io_rddata[1] & 0xf3);
+						(*vram_at(io_addr[1])) = (fx_cache[fx_cache_byte_index] & 0x0c) | (io_rddata[1] & 0xf3);
 						break;
 					case 0x03:
-						video_ram[io_addr[1] & 0x1FFFF] = (fx_cache[fx_cache_byte_index] & 0x03) | (io_rddata[1] & 0xfc);
+						(*vram_at(io_addr[1])) = (fx_cache[fx_cache_byte_index] & 0x03) | (io_rddata[1] & 0xfc);
 						break;
 				}
 				break; // break out of the enclosing switch statement early, too
@@ -2219,6 +2283,25 @@ void video_write(uint8_t reg, uint8_t value) {
 		case 0x0C: {
 			video_step(MHZ, 0, true); // potential midline raster effect
 			int i = reg - 0x09 + (io_dcsel << 2);
+
+			// VERA816 extension bank (doc/VERA816.md section 4.1)
+			if (io_dcsel == VERA816_DCSEL) {
+				switch (reg) {
+					case 0x09:  // $9F29 ADDRX
+						vera816_addrx = value & 0x0f;
+						// Re-apply to both address registers immediately, so
+						// the order of ADDRX vs ADDR_L/M/H writes does not
+						// matter to software.
+						io_addr[0] = (io_addr[0] & 0x1ffff) | ((uint32_t)(value & 0x03) << 17);
+						io_addr[1] = (io_addr[1] & 0x1ffff) | ((uint32_t)((value >> 2) & 0x03) << 17);
+						break;
+					case 0x0A: vera816_basex[0] = value & 0x0f; break;  // $9F2A L0_BASEX
+					case 0x0B: vera816_basex[1] = value & 0x0f; break;  // $9F2B L1_BASEX
+					case 0x0C: break;                                   // $9F2C VRAMCAP: read-only
+				}
+				return;
+			}
+
 			if (i == 0) {
 				// if progressive mode field goes from 0 to 1
 				// or if mode goes from vga to something else with
