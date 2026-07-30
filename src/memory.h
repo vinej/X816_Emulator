@@ -1,6 +1,16 @@
-// Commander X16 Emulator
+// X816 Emulator -- flat 16 MB memory system
+//
+// Derived from the Commander X16 Emulator
 // Copyright (c) 2019 Michael Steil
 // All rights reserved. License: 2-clause BSD
+//
+// The X16's banked map is gone. X816 is flat: the CPU's 24-bit address
+// {bank, offset} indexes one 16 MB array, with a 256-byte I/O page and a
+// 256-byte boot ROM overlay carved out of bank $00.
+//
+// This MUST agree with the RTL core exactly -- see the core's
+// doc/MEMORY_MAP.md. A divergence here is worse than having no emulator,
+// because software developed against one silently breaks on the other.
 
 #ifndef _MEMORY_H_
 #define _MEMORY_H_
@@ -12,10 +22,27 @@
 
 #define BANK_SIZE 65536
 
+// ---- X816 flat map ---------------------------------------------------------
+#define X816_RAM_SIZE   0x1000000u   // 16 MB, $00:0000-$FF:FFFF
+#define X816_IO_PAGE    0x9F00u      // bank $00 only
+#define X816_BOOT_BASE  0xFF00u      // bank $00 only
+#define X816_BOOT_SIZE  0x100u
+
+// SYSCTL, bank $00
+#define X816_SYSCTL         0x9F80u
+#define X816_SYSCTL_LAST    0x9F8Fu
+#define X816_SYSCTL_OVERLAY 0x01     // bit 0: boot ROM overlay enable (1 at reset)
+#define X816_SYSCTL_EMU     0x02     // bit 1: CPU E flag, read-only
+
+// x16emu's debug device. $9F90-$9FFF is open bus in the X816 map, so this
+// range is free; kept at the same address so existing tooling still works.
+#define DEVICE_EMULATOR (0x9fb0)
+
 #define USE_CURRENT_X16_BANK (-1)
 #define debug_read6502(a, b, x) real_read6502((a), (b), true, (x))
 
-// X16 r0-r15
+// Retained so ieee.c still compiles. X816 has no KERNAL and therefore no
+// r0-r15 pseudo-registers; nothing in the X816 build should use these.
 #define X16_REG_R0L (direct_page_add(2))
 #define X16_REG_R0H (direct_page_add(3))
 #define X16_REG_R1L (direct_page_add(4))
@@ -63,9 +90,17 @@ void memory_randomize_ram(bool);
 void memory_save(SDL_RWops *f, bool dump_ram, bool dump_bank);
 void memory_dump_usage_counts();
 
+// ---- X816 image loading ----------------------------------------------------
+// Mirrors the core's HPS ioctl path: a file's byte offset is its flat address.
+bool memory_load_boot_rom(const char *path);
+bool memory_load_flat(const char *path, uint32_t addr);
+
+// ---- Retained for the debugger / disassembler ------------------------------
+// X816 has no bank latches. These are stubs so debugger.c, disasm.c, main.c
+// and testbench.c keep compiling; the setters do nothing and the getters
+// always report 0.
 void memory_set_ram_bank(uint8_t bank);
 void memory_set_rom_bank(uint8_t bank);
-
 uint8_t memory_get_ram_bank();
 uint8_t memory_get_rom_bank();
 

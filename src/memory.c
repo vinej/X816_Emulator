@@ -1,6 +1,22 @@
-// Commander X16 Emulator
+// X816 Emulator -- flat 16 MB memory system
+//
+// Derived from the Commander X16 Emulator
 // Copyright (c) 2019 Michael Steil
 // All rights reserved. License: 2-clause BSD
+//
+// The X16's banked map is replaced wholesale. There are no $0000/$0001 bank
+// latches, no $A000-$BFFF window and no banked ROM: the CPU's 24-bit address
+// {bank, offset} indexes one flat 16 MB array.
+//
+//     $00:0000-$00:9EFF   RAM
+//     $00:9F00-$00:9FFF   I/O
+//     $00:A000-$00:FEFF   RAM
+//     $00:FF00-$00:FFFF   boot ROM overlay for READS while SYSCTL[0]=1,
+//                         RAM underneath for writes and once the bit is cleared
+//     $01:0000-$FF:FFFF   RAM
+//
+// This must agree with the RTL core exactly -- see the core's
+// doc/MEMORY_MAP.md, which is the authority.
 
 #include <sys/types.h>
 #include <string.h>
@@ -16,84 +32,63 @@
 #include "cpu/fake6502.h"
 #include "wav_recorder.h"
 #include "audio.h"
-#include "cartridge.h"
 #include "iso_8859_15.h"
-#include "midi.h"
 
+// Retained only so the X16 leftovers still link; unused by the flat map.
 uint8_t ram_bank;
 uint8_t rom_bank;
-
-uint8_t *RAM, *BRAM;
+uint8_t *BRAM;
 uint8_t ROM[ROM_SIZE];
-extern uint8_t *CART;
+
+uint8_t *RAM;                       // the flat 16 MB
+static uint8_t boot_rom[X816_BOOT_SIZE];
+static bool    boot_rom_loaded = false;
+
+// SYSCTL bit 0. Powers up SET, so the boot ROM shadows $00:FF00-$00:FFFF for
+// reads until software clears it -- see boot/boot.s in the core repo.
+static bool sysctl_overlay = true;
+
+// Floating-bus emulation. The RTL keeps the last byte transferred on the bus
+// and returns it for unmapped reads:
+//     always @(posedge cpu_clk) if (cpu_rdy) open_bus_r <= cpu_rwn ? cpu_di : cpu_do;
+// Returning $00 instead would make device-probing code false-positive on
+// "something present answering 0", so this is modelled rather than faked.
+static uint8_t open_bus = 0;
 
 static uint8_t addr_ym = 0;
 
 bool randomizeRAM = false;
 bool reportUninitializedAccess = false;
 const char *reportUsageStatisticsFilename = NULL;
-bool *RAM_access_flags, *BRAM_access_flags;
-uint64_t *RAM_system_reads;
-uint64_t *RAM_system_writes;
-uint64_t *RAM_banked_reads[256];
-uint64_t *RAM_banked_writes[256];
-uint64_t *ROM_banked_reads[256];
-uint64_t *ROM_banked_writes[256];	// shouldn't occur for obvious reasons unless Bonk RAM is installed in a cart
-
 
 static uint32_t clock_snap = 0UL;
 static uint32_t clock_base = 0UL;
 
-#define DEVICE_EMULATOR (0x9fb0)
-
-void cpuio_write(uint8_t reg, uint8_t value);
-
 void
 memory_init()
 {
-	// Initialize RAM array
-	RAM = calloc(RAM_SIZE, sizeof(uint8_t));
-	BRAM = calloc(BRAM_SIZE, sizeof(uint8_t));
-
-	if(reportUsageStatisticsFilename!=NULL) {
-		RAM_system_reads = calloc(num_banks * BANK_SIZE, sizeof(uint64_t));
-		RAM_system_writes = calloc(num_banks * BANK_SIZE, sizeof(uint64_t));
-		for(int bank=0; bank<256; ++bank) {
-			RAM_banked_reads[bank] = calloc(8192, sizeof(uint64_t));
-			RAM_banked_writes[bank] = calloc(8192, sizeof(uint64_t));
-			ROM_banked_reads[bank] = calloc(16384, sizeof(uint64_t));
-			ROM_banked_writes[bank] = calloc(16384, sizeof(uint64_t));
-		}
+	RAM = calloc(X816_RAM_SIZE, sizeof(uint8_t));
+	if (!RAM) {
+		fprintf(stderr, "X816: cannot allocate %u bytes of guest RAM\n", X816_RAM_SIZE);
+		exit(1);
 	}
 
+	// X816 has no banked RAM. BRAM is allocated as inert scratch only because
+	// two X16 leftovers still index it -- the debugger's bank editor
+	// (debugger.c) and BASIC paste poking the KERNAL keyboard buffer
+	// (main.c). Neither is reachable on X816; this keeps them from
+	// dereferencing NULL until they are stripped out.
+	BRAM = calloc(BANK_SIZE, sizeof(uint8_t));
 
-	// Randomize all RAM (if option selected)
+	// Bank 0 is M10K on hardware and comes up zeroed by FPGA configuration, so
+	// it is deterministic. Banks $01+ are SDRAM and come up as noise; randomize
+	// them under -randram so software that relies on zeroed SDRAM fails here
+	// rather than on the board.
 	if (randomizeRAM) {
 		time_t t;
 		srand((unsigned)time(&t));
-		for (int i = 0; i < RAM_SIZE; i++) {
-			if (i >= 0x9f00 && i < 0x10000) {
-				// Leave the unused hole in the address space at 0
-				// Memory dumps will likely confuse people less often
-				RAM[i] = 0;
-			} else {
-				RAM[i] = rand();
-			}
-		}
-		for (int i = 0; i < BRAM_SIZE; i++) {
-			BRAM[i] = rand();
-		}
-	}
-
-	// Initialize RAM access flag array (if option selected)
-	if (reportUninitializedAccess) {
-		RAM_access_flags = (bool*) malloc(RAM_SIZE * sizeof(bool));
-		for (int i = 0; i < RAM_SIZE; i++) {
-			RAM_access_flags[i] = false;
-		}
-		BRAM_access_flags = (bool*) malloc(BRAM_SIZE * sizeof(bool));
-		for (int i = 0; i < BRAM_SIZE; i++) {
-			BRAM_access_flags[i] = false;
+		for (uint32_t i = 0x10000; i < X816_RAM_SIZE; i++) {
+			RAM[i] = rand();
 		}
 	}
 
@@ -103,419 +98,225 @@ memory_init()
 void
 memory_reset()
 {
-	// default banks are 0
-	memory_set_ram_bank(0);
-	memory_set_rom_bank(0);
+	sysctl_overlay = true;
+	open_bus = 0;
 }
 
-void
-memory_report_uninitialized_access(bool value)
+bool
+memory_load_boot_rom(const char *path)
 {
-	reportUninitializedAccess = value;
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		fprintf(stderr, "X816: cannot open boot ROM '%s'\n", path);
+		return false;
+	}
+	size_t n = fread(boot_rom, 1, X816_BOOT_SIZE, f);
+	fclose(f);
+	if (n != X816_BOOT_SIZE) {
+		fprintf(stderr, "X816: boot ROM '%s' is %zu bytes, expected %u\n",
+		        path, n, X816_BOOT_SIZE);
+		return false;
+	}
+	boot_rom_loaded = true;
+	return true;
 }
 
-void
-memory_report_usage_statistics(const char *filename) {
-	reportUsageStatisticsFilename = filename;
-}
-
-void
-memory_randomize_ram(bool value)
+bool
+memory_load_flat(const char *path, uint32_t addr)
 {
-	randomizeRAM = value;
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		fprintf(stderr, "X816: cannot open image '%s'\n", path);
+		return false;
+	}
+	if (addr >= X816_RAM_SIZE) {
+		fprintf(stderr, "X816: load address $%06X is outside the 16 MB space\n", addr);
+		fclose(f);
+		return false;
+	}
+	size_t n = fread(&RAM[addr], 1, X816_RAM_SIZE - addr, f);
+	fclose(f);
+	printf("X816: loaded %zu bytes at $%06X\n", n, addr);
+	return true;
 }
 
-void
-memory_initialize_cart(uint8_t *mem)
+void memory_report_uninitialized_access(bool value) { reportUninitializedAccess = value; }
+void memory_report_usage_statistics(const char *filename) { reportUsageStatisticsFilename = filename; }
+void memory_randomize_ram(bool value) { randomizeRAM = value; }
+
+// ---------------------------------------------------------------------------
+// I/O page, bank $00 only. Layout is deliberately identical to the Commander
+// X16's so VERA/VIA/YM register offsets and drivers port over unchanged.
+// ---------------------------------------------------------------------------
+static uint8_t
+io_read(uint16_t address, bool debugOn)
 {
-	if(randomizeRAM) {
-		for(int i=0; i<0x4000; ++i) {
-			mem[i] = rand();
+	if (address < 0x9f10) {                       // $9F00-$9F0F  VIA #1
+		return via1_read(address & 0xf, debugOn);
+	} else if (address < 0x9f20) {                // $9F10-$9F1F  VIA #2
+		return via2_read(address & 0xf, debugOn);
+	} else if (address < 0x9f40) {                // $9F20-$9F3F  VERA
+		return video_read(address & 0x1f, debugOn);
+	} else if (address < 0x9f50) {                // $9F40-$9F4F  YM2151
+		if (!debugOn) audio_render();
+		return YM_read_status();
+	} else if (address >= X816_SYSCTL && address <= X816_SYSCTL_LAST) {
+		if ((address & 0xf) == 0) {               // $9F80  SYSCTL
+			return (sysctl_overlay ? X816_SYSCTL_OVERLAY : 0)
+			     | (regs.e ? X816_SYSCTL_EMU : 0);
 		}
-	} else {
-		memset(mem, 0, 0x4000);
+		return 0x00;                              // $9F81-$9F8F reserved
+	} else if (address >= DEVICE_EMULATOR && address < DEVICE_EMULATOR + 0x10) {
+		// EMULATOR-ONLY. The RTL treats $9F90-$9FFF as open bus, so this device
+		// does not exist on hardware. Guest software must not depend on it.
+		return emu_read(address & 0xf, debugOn);
 	}
+	return open_bus;                              // unmapped: floating bus
 }
 
-//
-// interface for fake6502
-//
-// if debugOn then reads memory only for debugger; no I/O, no side effects whatsoever
-
-static const char *format_addr(uint16_t address, uint8_t bank, uint8_t x16Bank) {
-	static char buffer[2 + 1 + 4 + 1];
-
-	if (bank == 0 && address >= 0xA000) {
-		if (address >= 0xA000) {
-			snprintf(buffer, sizeof(buffer), "%02X:%04X", x16Bank, address);
+static void
+io_write(uint16_t address, uint8_t value)
+{
+	if (address < 0x9f10) {                       // VIA #1
+		via1_write(address & 0xf, value);
+	} else if (address < 0x9f20) {                // VIA #2
+		via2_write(address & 0xf, value);
+	} else if (address < 0x9f40) {                // VERA
+		video_write(address & 0x1f, value);
+	} else if (address < 0x9f50) {                // YM2151: A0 selects reg/data
+		if ((address & 1) == 0) {
+			addr_ym = value;
+		} else {
+			audio_render();
+			YM_write_reg(addr_ym, value);
 		}
+	} else if (address >= X816_SYSCTL && address <= X816_SYSCTL_LAST) {
+		if ((address & 0xf) == 0) {
+			sysctl_overlay = (value & X816_SYSCTL_OVERLAY) != 0;
+		}
+	} else if (address >= DEVICE_EMULATOR && address < DEVICE_EMULATOR + 0x10) {
+		emu_write(address & 0xf, value);          // emulator-only, see io_read
 	}
-	else if (is_gen2) {
-		snprintf(buffer, sizeof(buffer), "%02X %04X", bank, address);
-	} else {
-		snprintf(buffer, sizeof(buffer), "%04X", address);
-	}
-
-	return buffer;
+	// everything else in the I/O page is unmapped; writes are discarded
 }
 
-uint8_t
-read6502(uint16_t address, uint8_t bank) {
-	if (!is_gen2) bank = 0;
-	// Report access to uninitialized RAM (if option selected)
-	if (reportUninitializedAccess) {
-		if (bank == 0) {
-			uint8_t pc_x16_bank;
-
-			if (opcode_addr < 0xa000) {
-				pc_x16_bank = 0;
-			} else if (opcode_addr < 0xc000) {
-				pc_x16_bank = memory_get_ram_bank();
-			} else {
-				pc_x16_bank = memory_get_rom_bank();
-			}
-
-			if (address >= 0xa000 && address < 0xc000) {
-				if (memory_get_ram_bank() < num_ram_banks && BRAM_access_flags[(memory_get_ram_bank() << 13) + address - 0xa000] == false){
-					printf("Warning: %02X:%04X accessed uninitialized RAM address %02X:%04X\n", pc_x16_bank, opcode_addr, memory_get_ram_bank(), address);
-				}
-			}
-		}
-
-		if (bank != 0 || address < 0x9f00) {
-			if (RAM_access_flags[bank * BANK_SIZE + address] == false) {
-				printf("Warning: %s accessed uninitialized RAM address %02X %04X\n", format_addr(opcode_addr, regs.k, 0), bank, address);
-			}
-		}
-	}
-
-    if (reportUsageStatisticsFilename!=NULL) {
-      if (bank != 0 || address < 0xa000) {
-        RAM_system_reads[bank * BANK_SIZE + address]++;
-      } else if (address < 0xc000) {
-        RAM_banked_reads[memory_get_ram_bank()][address-0xa000]++;
-      } else {
-		ROM_banked_reads[rom_bank][address-0xc000]++;
-      }
-    }
-
-	return real_read6502(address, bank, false, USE_CURRENT_X16_BANK);
-}
-
+// ---------------------------------------------------------------------------
+// Bus
+// ---------------------------------------------------------------------------
 uint8_t
 real_read6502(uint16_t address, uint8_t bank, bool debugOn, int16_t x16Bank)
 {
-	if (is_gen2 && bank != 0) { // RAM
-		if (bank < num_banks) {
-			return RAM[bank * BANK_SIZE + address];
-		} else {
-			return (address >> 8) & 0xff; // open bus read
-		}
+	(void)x16Bank;                                // no bank latches on X816
+
+	if (bank != 0) {                              // $01:0000-$FF:FFFF
+		return RAM[((uint32_t)bank << 16) | address];
 	}
 
-	if (address < 0x9f00) { // RAM
+	if (address < X816_IO_PAGE) {                 // $0000-$9EFF
 		return RAM[address];
-	} else if (address < 0xa000) { // I/O
-		if (!debugOn && address >= 0x9fa0) {
-			// slow IO5-7 range
-			clockticks6502 += 3;
-		}
-		if (address >= 0x9f00 && address < 0x9f10) {
-			return via1_read(address & 0xf, debugOn);
-		} else if (has_via2 && (address >= 0x9f10 && address < 0x9f20)) {
-			return via2_read(address & 0xf, debugOn);
-		} else if (address >= 0x9f20 && address < 0x9f40) {
-			return video_read(address & 0x1f, debugOn);
-		} else if (address >= 0x9f40 && address < 0x9f60) {
-			// slow IO2 range
-			if (!debugOn) {
-				clockticks6502 += 3;
-			}
-			if ((address & 0x01) != 0) { // partial decoding in this range
-				audio_render();
-				return YM_read_status();
-			}
-			return 0x9f; // open bus read
-		} else if (address >= 0x9fb0 && address < 0x9fc0) {
-			// emulator state
-			return emu_read(address & 0xf, debugOn);
-		} else if (has_midi_card && (address & 0xfff0) == midi_card_addr) {
-			// midi card
-			return midi_serial_read(address & 0xf, debugOn);
-		} else {
-			// future expansion
-			return 0x9f; // open bus read
-		}
-	} else if (address < 0xc000) { // banked RAM
-		int ramBank = x16Bank >= 0 ? (uint8_t)x16Bank : memory_get_ram_bank();
-		if (ramBank < num_ram_banks) {
-			return BRAM[(ramBank << 13) + address - 0xa000];
-		} else {
-			return (address >> 8) & 0xff; // open bus read
-		}
-	} else { // banked ROM
-		int romBank = x16Bank >= 0 ? (uint8_t)x16Bank : rom_bank;
-		if (romBank < 32) {
-			return ROM[(romBank << 14) + address - 0xc000];
-		} else {
-			if (!CART) {
-				return (address >> 8) & 0xff; // open bus read
-			}
-			return cartridge_read(address, romBank);
-		}
 	}
+	if (address < 0xa000) {                       // $9F00-$9FFF
+		return io_read(address, debugOn);
+	}
+	if (address >= X816_BOOT_BASE && sysctl_overlay) {
+		// The overlay shadows RAM for READS only; the RAM underneath is what
+		// writes reach, which is what lets the boot stub copy itself down and
+		// then unmap itself without disturbing the instruction stream.
+		return boot_rom[address - X816_BOOT_BASE];
+	}
+	return RAM[address];                          // $A000-$FEFF, and $FF00+ once unmapped
+}
+
+uint8_t
+read6502(uint16_t address, uint8_t bank)
+{
+	uint8_t v = real_read6502(address, bank, false, USE_CURRENT_X16_BANK);
+	open_bus = v;
+	return v;
 }
 
 void
 write6502(uint16_t address, uint8_t bank, uint8_t value)
 {
-	if (!is_gen2) bank = 0;
+	open_bus = value;
 
-	if(reportUsageStatisticsFilename!=NULL) {
-		if (bank != 0 || address < 0xa000) {
-			RAM_system_writes[bank * BANK_SIZE + address]++;
-		} else if (address < 0xc000) {
-			RAM_banked_writes[memory_get_ram_bank()][address-0xa000]++;
-		} else {
-			// this is weird, but it does occur. And cartridges can install "Bonk RAM" in place of ROM.
-			ROM_banked_writes[rom_bank][address-0xc000]++;
-		}
-	}
-
-	// Update RAM access flag
-	if (reportUninitializedAccess) {
-		if (bank != 0 || address < 0xa000) {
-			RAM_access_flags[bank * BANK_SIZE + address] = true;
-		} else if (address < 0xc000) {
-			if (memory_get_ram_bank() < num_ram_banks)
-				BRAM_access_flags[(memory_get_ram_bank() << 13) + address - 0xa000] = true;
-		}
-	}
-
-	// Write to memory
-	if (is_gen2 && bank != 0) {
-		if (bank < num_banks) {
-			RAM[bank * BANK_SIZE + address] = value;
-		}
+	if (bank != 0) {                              // $01:0000-$FF:FFFF
+		RAM[((uint32_t)bank << 16) | address] = value;
 		return;
 	}
 
-	// Write to CPU I/O ports
-	if (address < 2) {
-		cpuio_write(address, value);
-	}
-	// Write to memory
-	if (address < 0x9f00) { // RAM
+	if (address < X816_IO_PAGE) {                 // $0000-$9EFF
 		RAM[address] = value;
-	} else if (address < 0xa000) { // I/O
-		if (address >= 0x9fa0) {
-			// slow IO5-7 range
-			clockticks6502 += 3;
-		}
-		if (address >= 0x9f00 && address < 0x9f10) {
-			via1_write(address & 0xf, value);
-		} else if (has_via2 && (address >= 0x9f10 && address < 0x9f20)) {
-			via2_write(address & 0xf, value);
-		} else if (address >= 0x9f20 && address < 0x9f40) {
-			video_write(address & 0x1f, value);
-		} else if (address >= 0x9f40 && address < 0x9f60) {
-			// slow IO2 range
-			clockticks6502 += 3;
-			if ((address & 0x01) == 0) {   // YM reg (partially decoded)
-				addr_ym = value;
-			} else {                       // YM data (partially decoded)
-				audio_render();
-				YM_write_reg(addr_ym, value);
-			}
-		} else if (address >= 0x9fb0 && address < 0x9fc0) {
-			// emulator state
-			emu_write(address & 0xf, value);
-		} else if (has_midi_card && (address & 0xfff0) == midi_card_addr) {
-			midi_serial_write(address & 0xf, value);
-		} else {
-			// future expansion
-		}
-	} else if (address < 0xc000) { // banked RAM
-		if (memory_get_ram_bank() < num_ram_banks) {
-			BRAM[(memory_get_ram_bank() << 13) + address - 0xa000] = value;
-		}
-	} else { // ROM
-		if (rom_bank >= 32) { // Cartridge ROM/RAM
-			cartridge_write(address, rom_bank, value);
-		}
-		// ignore if base ROM (banks 0-31)
+		return;
 	}
+	if (address < 0xa000) {                       // $9F00-$9FFF
+		io_write(address, value);
+		return;
+	}
+	// $A000-$FFFF, including the boot page: writes ALWAYS reach RAM, even
+	// while the overlay is mapped for reads.
+	RAM[address] = value;
 }
 
 void
 vp6502()
 {
-	memory_set_rom_bank(0);
+	// On the X16 a vector pull forced the ROM bank latch to 0. X816 has no
+	// bank latch and its vectors are ordinary bank-$00 reads, so this is a
+	// deliberate no-op -- see the core's p65c816_flat_wrap.vhd, which drops
+	// the VPB output for the same reason.
 }
-
-//
-// saves the memory content into a file
-//
 
 void
 memory_save(SDL_RWops *f, bool dump_ram, bool dump_bank)
 {
+	(void)dump_bank;                              // no banked RAM on X816
 	if (dump_ram) {
-		SDL_RWwrite(f, &RAM[0], sizeof(uint8_t), is_gen2 ? num_banks * BANK_SIZE : 0xa000);
+		SDL_RWwrite(f, &RAM[0], sizeof(uint8_t), X816_RAM_SIZE);
 	}
-	if (dump_bank) {
-		SDL_RWwrite(f, &BRAM[0], sizeof(uint8_t), (num_ram_banks * 8192));
-	}
-}
-
-
-void writestring(SDL_RWops *f, const char *string) {
-	SDL_RWwrite(f, string, strlen(string), 1);
-}
-
-void memory_dump_usage_counts() {
-	if(reportUsageStatisticsFilename==NULL)
-		return;
-
-	SDL_RWops *f = SDL_RWFromFile(reportUsageStatisticsFilename, "w");
-	if (!f) {
-		printf("Cannot write to %s!\n", reportUsageStatisticsFilename);
-		return;
-	}
-
-	writestring(f, "Usage counts of all memory locations. Locations not printed have count zero.\n");
-	writestring(f, "Tip: use 'sort -r -n -k 3' to sort it so it shows the most used at the top.\n");
-	writestring(f, "\nsystem RAM reads:\n");
-	int addr;
-	char buf[100];
-	for(addr=0; addr<num_banks * BANK_SIZE; ++addr) {
-		if(RAM_system_reads[addr]>0) {
-			SDL_RWwrite(f, buf, snprintf(buf, sizeof(buf), "r %04x %" PRIu64 "\n", addr, RAM_system_reads[addr]), 1);
-		}
-	}
-	writestring(f, "\nsystem RAM writes:\n");
-	for(addr=0; addr<65536; ++addr) {
-		if(RAM_system_writes[addr]>0) {
-			SDL_RWwrite(f, buf, snprintf(buf, sizeof(buf), "w %04x %" PRIu64 "\n", addr, RAM_system_writes[addr]), 1);
-		}
-	}
-	writestring(f, "\nbanked RAM reads:\n");
-	int bank;
-	for(bank=0; bank<256; ++bank) {
-		for(addr=0; addr<8192; ++addr) {
-			if(RAM_banked_reads[bank][addr]>0) {
-				SDL_RWwrite(f, buf, snprintf(buf, sizeof(buf), "r %02x:%04x %" PRIu64 "\n", bank, addr+0xa000, RAM_banked_reads[bank][addr]), 1);
-			}
-		}
-	}
-	writestring(f, "\nbanked RAM writes:\n");
-	for(bank=0; bank<256; ++bank) {
-		for(addr=0; addr<8192; ++addr) {
-			if(RAM_banked_writes[bank][addr]>0) {
-				SDL_RWwrite(f, buf, snprintf(buf, sizeof(buf), "w %02x:%04x %" PRIu64 "\n", bank, addr+0xa000, RAM_banked_writes[bank][addr]), 1);
-			}
-		}
-	}
-	writestring(f, "\nbanked ROM reads:\n");
-	for(bank=0; bank<256; ++bank) {
-		for(addr=0; addr<16384; ++addr) {
-			if(ROM_banked_reads[bank][addr]>0) {
-				SDL_RWwrite(f, buf, snprintf(buf, sizeof(buf), "r %02x:%04x %" PRIu64 "\n", bank, addr+0xc000, ROM_banked_reads[bank][addr]), 1);
-			}
-		}
-	}
-	writestring(f, "\nbanked ROM / 'Bonk RAM' writes:\n");
-	for(bank=0; bank<256; ++bank) {
-		for(addr=0; addr<16384; ++addr) {
-			if(ROM_banked_writes[bank][addr]>0) {
-				SDL_RWwrite(f, buf, snprintf(buf, sizeof(buf), "w %02x:%04x %" PRIu64 "\n", bank, addr+0xc000, ROM_banked_writes[bank][addr]), 1);
-			}
-		}
-	}
-
-	SDL_RWclose(f);
-}
-
-
-///
-///
-///
-
-inline void
-memory_set_ram_bank(uint8_t bank)
-{
-	ram_bank = bank;
-}
-
-inline uint8_t
-memory_get_ram_bank()
-{
-	return ram_bank;
-}
-
-inline void
-memory_set_rom_bank(uint8_t bank)
-{
-	rom_bank = bank;
-}
-
-inline uint8_t
-memory_get_rom_bank()
-{
-	return rom_bank;
 }
 
 void
-cpuio_write(uint8_t reg, uint8_t value)
+memory_dump_usage_counts()
 {
-	switch (reg) {
-		case 0:
-			memory_set_ram_bank(value);
-			break;
-		case 1:
-			memory_set_rom_bank(value);
-			break;
-	}
+	if (reportUsageStatisticsFilename == NULL) return;
+	printf("X816: per-address usage statistics are not implemented for the flat "
+	       "16 MB map (the X16 version indexed by bank latch).\n");
 }
+
+// ---- Bank-latch stubs ------------------------------------------------------
+// Kept so debugger.c, disasm.c, main.c and testbench.c keep compiling.
+void memory_set_ram_bank(uint8_t bank) { (void)bank; }
+void memory_set_rom_bank(uint8_t bank) { (void)bank; }
+uint8_t memory_get_ram_bank() { return 0; }
+uint8_t memory_get_rom_bank() { return 0; }
 
 // Control the GIF recorder
 void
 emu_recorder_set(gif_recorder_command_t command)
 {
-	// turning off while recording is enabled
 	if (command == RECORD_GIF_PAUSE && record_gif != RECORD_GIF_DISABLED) {
-		record_gif = RECORD_GIF_PAUSED; // need to save
+		record_gif = RECORD_GIF_PAUSED;
 	}
-	// turning on continuous recording
 	if (command == RECORD_GIF_RESUME && record_gif != RECORD_GIF_DISABLED) {
-		record_gif = RECORD_GIF_ACTIVE;		// activate recording
+		record_gif = RECORD_GIF_ACTIVE;
 	}
-	// capture one frame
 	if (command == RECORD_GIF_SNAP && record_gif != RECORD_GIF_DISABLED) {
-		record_gif = RECORD_GIF_SINGLE;		// single-shot
+		record_gif = RECORD_GIF_SINGLE;
 	}
 }
 
 //
 // read/write emulator state (feature flags)
 //
-// 0: debugger_enabled
-// 1: log_video
-// 2: log_keyboard
-// 3: echo_mode
-// 4: save_on_exit
+// 0: debugger_enabled            8: write: reset cpu clock counter
+// 1: log_video                   8: read: snapshot cpu clock, bits 0-7
+// 2: log_keyboard                9: write: debug byte 1 / read: clock 8-15
+// 3: echo_mode                  10: write: debug byte 2 / read: clock 16-23
+// 4: save_on_exit               11: write: char to STDOUT / read: clock 24-31
 // 5: record_gif
 // 6: record_wav
 // 7: cmd key toggle
-// 8: write: reset cpu clock counter
-// 8: read: snapshots cpu clock counter and reads the LSB bits 0-7
-// 9: write: output debug byte 1
-// 9: read: cpu clock bits 8-15
-// 10: write: output debug byte 2
-// 10: read: cpu clock bits 16-23
-// 11: write: write character to STDOUT of console
-// 11: read: cpu clock MSB bits 24-31
-// POKE $9FB3,1:PRINT"ECHO MODE IS ON":POKE $9FB3,0
 void
 emu_write(uint8_t reg, uint8_t value)
 {
@@ -538,7 +339,7 @@ emu_write(uint8_t reg, uint8_t value)
 			} else if (value >= 0xa1) {
 				print_iso8859_15_char((char) value);
 			} else {
-				printf("\xef\xbf\xbd"); // �
+				printf("\xef\xbf\xbd");
 			}
 			fflush(stdout);
 			break;
@@ -581,9 +382,9 @@ emu_read(uint8_t reg, bool debugOn)
 	} else if (reg == 13) {
 		return keymap;
 	} else if (reg == 14) {
-		return '1'; // emulator detection
+		return '8'; // emulator detection: "816"
 	} else if (reg == 15) {
-		return '6'; // emulator detection
+		return '1';
 	}
 	if (!debugOn) printf("WARN: Invalid register %x\n", DEVICE_EMULATOR + reg);
 	return -1;
