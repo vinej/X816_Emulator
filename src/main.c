@@ -136,7 +136,10 @@ char *cartridge_path = NULL;
 bool has_midi_card = false;
 uint16_t midi_card_addr;
 
-bool using_hostfs = true;
+// X816 has no KERNAL, so the IEEE/hostfs layer -- which patches KERNAL
+// vectors and looks up ROM symbols like cbdos_flags -- has nothing to attach
+// to. Off by default; the guest SD path is a separate piece of work.
+bool using_hostfs = false;
 
 uint8_t MHZ = 8;
 
@@ -150,6 +153,14 @@ SDL_RWops *prg_file;
 bool prg_finished_loading;
 int prg_override_start = -1;
 bool run_after_load = false;
+
+// ---- X816 image loading ----------------------------------------------------
+// -boot <file>          256-byte boot overlay for $00:FF00-$00:FFFF
+// -load <hexaddr>,<f>   raw image at a flat 24-bit address
+#define X816_MAX_LOADS 8
+char *x816_boot_path = NULL;
+struct { uint32_t addr; char *path; } x816_loads[X816_MAX_LOADS];
+int x816_num_loads = 0;
 
 char *nvram_path = NULL;
 
@@ -393,8 +404,15 @@ usage()
 	printf("\n(C)2019, 2023 Michael Steil et al.\n");
 	printf("All rights reserved. License: 2-clause BSD\n\n");
 	printf("Usage: x16emu [option] ...\n\n");
+	printf("-boot <boot.rom>\n");
+	printf("\tX816 boot overlay, exactly 256 bytes, mapped at $00:FF00-$00:FFFF\n");
+	printf("\tfor reads while SYSCTL[0] is set. Required: without it the CPU\n");
+	printf("\tfetches its reset vector from a zeroed page.\n");
+	printf("-load <hexaddr>,<file>\n");
+	printf("\tLoad a raw image at a flat 24-bit address, e.g. -load 000400,hello.bin\n");
+	printf("\tMay be given up to 8 times. Mirrors the core's HPS image loader.\n");
 	printf("-rom <rom.bin>\n");
-	printf("\tOverride KERNAL/BASIC/* ROM file.\n");
+	printf("\tIgnored. X816 has no system ROM; see -boot.\n");
 	printf("-ram <ramsize>\n");
 	printf("\tSpecify banked RAM size in KB (8, 16, 32, ..., 2048).\n");
 	printf("\tThe default is 512.\n");
@@ -630,7 +648,35 @@ main(int argc, char **argv)
 	argv++;
 
 	while (argc > 0) {
-		if (!strcmp(argv[0], "-rom")) {
+		if (!strcmp(argv[0], "-boot")) {
+			argc--;
+			argv++;
+			if (!argc || argv[0][0] == '-') {
+				usage();
+			}
+			x816_boot_path = argv[0];
+			argc--;
+			argv++;
+		} else if (!strcmp(argv[0], "-load")) {
+			argc--;
+			argv++;
+			if (!argc) {
+				usage();
+			}
+			// <hexaddr>,<file> -- the address is where the image lands in the
+			// flat 16 MB space, matching how the core's HPS loader treats a
+			// file's byte offset as its flat address.
+			char *comma = strchr(argv[0], ',');
+			if (!comma || x816_num_loads >= X816_MAX_LOADS) {
+				usage();
+			}
+			*comma = '\0';
+			x816_loads[x816_num_loads].addr = (uint32_t)strtoul(argv[0], NULL, 16);
+			x816_loads[x816_num_loads].path = comma + 1;
+			x816_num_loads++;
+			argc--;
+			argv++;
+		} else if (!strcmp(argv[0], "-rom")) {
 			argc--;
 			argv++;
 			if (!argc || argv[0][0] == '-') {
@@ -1155,14 +1201,11 @@ main(int argc, char **argv)
 		num_ram_banks = NUM_MAX_RAM_BANKS;
 	}
 
-	SDL_RWops *f = SDL_RWFromFile(rom_path, "rb");
-	if (!f) {
-		printf("Cannot open %s!\n", rom_path);
-		exit(1);
-	}
-	size_t rom_size = SDL_RWread(f, ROM, ROM_SIZE, 1);
-	(void)rom_size;
-	SDL_RWclose(f);
+	// X816 has no system ROM. The only non-volatile code is the 256-byte boot
+	// overlay at $00:FF00, loaded with -boot after memory_init() below (it
+	// needs RAM allocated first). -rom is accepted and ignored so existing
+	// command lines do not break.
+	(void)rom_path;
 
 	if (nvram_path) {
 		SDL_RWops *f = SDL_RWFromFile(nvram_path, "rb");
@@ -1274,7 +1317,33 @@ main(int argc, char **argv)
 
 	wav_recorder_set_path(wav_path);
 
+	// X816 is a native-mode 65C816, always. This is not a configurable
+	// property of the machine, so it is forced rather than left to -c816:
+	// getting it wrong presents as the CPU decoding 16-bit immediates as
+	// 8-bit and then executing the operand's high byte as an opcode, which
+	// is a genuinely confusing way to lose an afternoon.
+	regs.is65c816 = true;
+	is_gen2 = false;
+
 	memory_init();
+
+	// X816 images. The boot overlay must be present or the CPU fetches its
+	// reset vector from a zeroed page and immediately BRKs. Flat images are
+	// loaded afterwards so a -load can overwrite bank-0 RAM under the overlay,
+	// exactly as the core's HPS ioctl path does with the CPU held in reset.
+	if (x816_boot_path) {
+		if (!memory_load_boot_rom(x816_boot_path)) {
+			exit(1);
+		}
+	} else {
+		printf("X816: no -boot image given; $00:FF00-$00:FFFF reads as zero "
+		       "and the CPU will BRK out of reset.\n");
+	}
+	for (int i = 0; i < x816_num_loads; i++) {
+		if (!memory_load_flat(x816_loads[i].path, x816_loads[i].addr)) {
+			exit(1);
+		}
+	}
 
 	joystick_init();
 
