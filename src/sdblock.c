@@ -34,8 +34,9 @@
 #define R_MEM1   0x6
 #define R_MEM2   0x7
 #define R_COUNT  0x8
-#define R_CMD    0x9
-#define R_DATA   0xA
+#define R_CMD    0x9   /* write only */
+#define R_STATUS 0xA   /* read only -- a SEPARATE address, see rtl/sd_block.sv */
+#define R_DATA   0xC   /* $9F8B is a mandatory gap below it, see rtl/sd_block.sv */
 
 #define CMD_READ    1   // card -> memory, COUNT blocks, by DMA
 #define CMD_WRITE   2   // buffer -> card, one block
@@ -181,7 +182,7 @@ sdblock_read(uint8_t reg, bool debugOn)
 	case R_MEM1:  return (uint8_t)(reg_mem >> 8);
 	case R_MEM2:  return (uint8_t)(reg_mem >> 16);
 	case R_COUNT: return reg_count;
-	case R_CMD:
+	case R_STATUS:
 		// busy is always 0: on hardware the CPU is stalled for the whole
 		// transfer, so it can never observe itself busy either.
 		return (uint8_t)((reg_error ? ST_ERROR : 0)

@@ -166,7 +166,7 @@ io_read(uint16_t address, bool debugOn)
 			return (sysctl_overlay ? X816_SYSCTL_OVERLAY : 0)
 			     | (regs.e ? X816_SYSCTL_EMU : 0);
 		}
-		return sdblock_read(address & 0xf, debugOn);  // $9F81-$9F8A  SD
+		return sdblock_read(address & 0xf, debugOn);  // $9F81-$9F8B  SD
 	} else if (address >= DEVICE_EMULATOR && address < DEVICE_EMULATOR + 0x10) {
 		// EMULATOR-ONLY. The RTL treats $9F90-$9FFF as open bus, so this device
 		// does not exist on hardware. Guest software must not depend on it.
@@ -195,7 +195,7 @@ io_write(uint16_t address, uint8_t value)
 		if ((address & 0xf) == 0) {
 			sysctl_overlay = (value & X816_SYSCTL_OVERLAY) != 0;
 		} else {
-			sdblock_write(address & 0xf, value);     // $9F81-$9F8A  SD
+			sdblock_write(address & 0xf, value);     // $9F81-$9F8B  SD
 		}
 	} else if (address >= DEVICE_EMULATOR && address < DEVICE_EMULATOR + 0x10) {
 		emu_write(address & 0xf, value);          // emulator-only, see io_read
