@@ -42,6 +42,7 @@
 #include "version.h"
 #include "wav_recorder.h"
 #include "testbench.h"
+#include "keyboard.h"
 #include "cartridge.h"
 #include "midi.h"
 #include "git_rev.h"
@@ -533,6 +534,10 @@ usage()
 	printf("\tSet the real-time-clock to the current system time and date.\n");
 	printf("-via2\n");
 	printf("\tInstall the second VIA chip expansion at $9F10\n");
+	printf("-autokeys <text>\n");
+	printf("\tType <text> on the keyboard automatically, no window needed.\n");
+	printf("\tUse \\n for Enter. Feeds the same SMC key FIFO a real key\n");
+	printf("\tdoes, so it exercises the real I2C GETKEY path.\n");
 	printf("-testbench\n");
 	printf("\tHeadless mode for unit testing with an external test runner\n");
 	printf("-mhz <integer>\n");
@@ -1145,6 +1150,15 @@ main(int argc, char **argv)
 			argc--;
 			argv++;
 			exit(0);
+		} else if (!strcmp(argv[0], "-autokeys")){
+			argc--;
+			argv++;
+			if (!argc) {
+				usage();
+			}
+			autokeys_set(argv[0]);
+			argc--;
+			argv++;
 		} else if (!strcmp(argv[0], "-testbench")){
 			printf("Testbench mode...\n");
 			fflush(stdout);
@@ -1811,6 +1825,7 @@ emulator_loop(void *param)
 		for (uint32_t i = 0; i < clocks; i++) {
 			i2c_step();
 		}
+		autokeys_step(clocks);
 		rtc_step(clocks);
 
 		if (!headless) {

@@ -263,3 +263,97 @@ handle_keyboard(bool down, SDL_Keycode sym, SDL_Scancode scancode)
 		i2c_kbd_buffer_add(keynum & 0xff);
 	}
 }
+/* ===========================================================================
+ * -autokeys: type a string into the SMC key FIFO, headlessly.
+ *
+ * See keyboard.h for why this exists. The keycodes are IBM System/2 positions,
+ * the same numbering keynum_from_SDL_Scancode() produces above and the same one
+ * the X816 console's keymap decodes -- so this drives the real path rather than
+ * a parallel one.
+ * =========================================================================== */
+
+/* keycode -> ASCII, unshifted. Index is the keycode; 0 means "no plain ASCII".
+   Deliberately identical to X816_Calypsi runtime/font8x8.c keymap[64], because
+   a test that used a DIFFERENT table would prove the table rather than the
+   path. */
+static const unsigned char autokey_ascii[64] = {
+	0,    0,    '1',  '2',  '3',  '4',  '5',  '6',
+	'7',  '8',  '9',  '0',  '-',  '=',  0,    0x08,
+	0x09, 'Q',  'W',  'E',  'R',  'T',  'Y',  'U',
+	'I',  'O',  'P',  '[',  ']',  92,   0,    'A',
+	'S',  'D',  'F',  'G',  'H',  'J',  'K',  'L',
+	';',  39,   0,    0x0D, 0,    0,    'Z',  'X',
+	'C',  'V',  'B',  'N',  'M',  ',',  '.',  '/',
+	0,    0,    0,    0,    0,    ' ',  0,    0
+};
+
+static const char *autokeys_text = NULL;
+static uint32_t    autokeys_timer = 0;
+static bool        autokeys_release = false;
+static uint8_t     autokeys_pending = 0;
+
+/* Roughly 25 ms of an 8 MHz clock between events. Fast enough that a test
+   finishes in seconds, slow enough that a program polling the SMC in a loop
+   cannot miss one -- a real key is held far longer than this. */
+#define AUTOKEYS_INTERVAL 200000
+
+void
+autokeys_set(const char *text)
+{
+	autokeys_text    = text;
+	autokeys_timer   = AUTOKEYS_INTERVAL * 20;   /* let the program start up */
+	autokeys_release = false;
+}
+
+void
+autokeys_step(uint32_t clocks)
+{
+	unsigned char c;
+	int i, code;
+
+	if (!autokeys_text)
+		return;
+	if (autokeys_timer > clocks) {
+		autokeys_timer -= clocks;
+		return;
+	}
+	autokeys_timer = AUTOKEYS_INTERVAL;
+
+	/* Every press is followed by its release, exactly as a real keyboard does.
+	   Skipping the release would leave code that filters bit 7 untested, which
+	   is precisely the kind of gap that put us here. */
+	if (autokeys_release) {
+		i2c_kbd_buffer_add(autokeys_pending | 0x80);
+		autokeys_release = false;
+		return;
+	}
+
+	if (!*autokeys_text) {
+		autokeys_text = NULL;                     /* done */
+		return;
+	}
+
+	c = (unsigned char)*autokeys_text++;
+	if (c == '\\' && *autokeys_text == 'n') {    /* literal backslash-n */
+		autokeys_text++;
+		c = 0x0D;
+	} else if (c == '\n') {
+		c = 0x0D;
+	} else if (c >= 'a' && c <= 'z') {
+		c = (unsigned char)(c - 32);              /* the table is upper case */
+	}
+
+	code = -1;
+	for (i = 0; i < 64; i++) {
+		if (autokey_ascii[i] == c) {
+			code = i;
+			break;
+		}
+	}
+	if (code < 0)
+		return;                                   /* not typeable: skip it */
+
+	i2c_kbd_buffer_add((uint8_t)code);
+	autokeys_pending = (uint8_t)code;
+	autokeys_release = true;
+}
