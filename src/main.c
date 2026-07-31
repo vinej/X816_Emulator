@@ -29,6 +29,7 @@
 #include "smc.h"
 #include "vera_spi.h"
 #include "sdcard.h"
+#include "sdblock.h"
 #include "ieee.h"
 #include "glue.h"
 #include "debugger.h"
@@ -1216,7 +1217,16 @@ main(int argc, char **argv)
 	}
 
 	if (sdcard_path) {
-		sdcard_set_path(sdcard_path);
+		// X816 reaches the card through the block device at $9F81-$9F8A
+		// (src/sdblock.c), not by bit-banging SPI. The SPI path stays wired
+		// so an X16 image can still be inspected, but the guest kernel uses
+		// the block device.
+		sdblock_set_path(sdcard_path);
+		sdblock_attach();
+		// Deliberately NOT sdcard_set_path(): that is the X16's SPI path, and
+		// on Windows the second open of the same image fails, which prints a
+		// misleading "Cannot open SDCard file". X816's guest reaches the card
+		// only through the block device.
 		if (!hostfs_set) {
 			using_hostfs = false;
 		}

@@ -186,6 +186,7 @@ set(X16_SOURCES
     src/vera_pcm.c
     src/vera_psg.c
     src/sdcard.c
+    src/sdblock.c
     src/main.c
     src/debugger.c
     src/javascript_interface.c
