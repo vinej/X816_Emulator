@@ -276,8 +276,11 @@ handle_keyboard(bool down, SDL_Keycode sym, SDL_Scancode scancode)
    Deliberately identical to X816_Calypsi runtime/font8x8.c keymap[64], because
    a test that used a DIFFERENT table would prove the table rather than the
    path. */
+/* Index 1 is the ESC key. It used to be 0 -- unmapped -- which meant a test
+   whose only way out was ESC could not be driven headlessly at all, and the
+   recovery path would have gone to hardware unexercised. */
 static const unsigned char autokey_ascii[64] = {
-	0,    0,    '1',  '2',  '3',  '4',  '5',  '6',
+	0,    0x1B, '1',  '2',  '3',  '4',  '5',  '6',
 	'7',  '8',  '9',  '0',  '-',  '=',  0,    0x08,
 	0x09, 'q',  'w',  'e',  'r',  't',  'y',  'u',
 	'i',  'o',  'p',  '[',  ']',  92,   0,    'a',
@@ -291,7 +294,7 @@ static const unsigned char autokey_ascii[64] = {
    with. A character reachable only with Shift has to be typed WITH Shift, or
    the shift path is never exercised and ':' cannot be sent at all. */
 static const unsigned char autokey_shift[64] = {
-	0,    0,    '!',  '@',  '#',  '$',  '%',  '^',
+	0,    0x1B, '!',  '@',  '#',  '$',  '%',  '^',
 	'&',  '*',  '(',  ')',  '_',  '+',  0,    0x08,
 	0x09, 'Q',  'W',  'E',  'R',  'T',  'Y',  'U',
 	'I',  'O',  'P',  '{',  '}',  '|',  0,    'A',

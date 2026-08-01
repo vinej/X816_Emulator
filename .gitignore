@@ -11,3 +11,6 @@ build/
 
 # Test recordings: every -gif run drops one of these in the tree.
 *.gif
+
+# A second CMake tree, used when the Makefile cannot find MinGW.
+build2/
