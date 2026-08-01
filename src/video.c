@@ -139,6 +139,21 @@ static uint8_t vera816_basex[2];   // per layer: [1:0] MAPBASE[9:8], [3:2] TILEB
 // FILL value.
 #define VERA816_BLT_DCSEL    33
 #define VERA816_BLT_ID_VALUE 0xB6
+
+// VERA816 control bank, DCSEL=34 (doc/VERA816.md section 4.4):
+//   $9F29 CTRL816   R/W  bit 0 = REGWIN: 0 = the PSG/palette/sprite-attribute
+//                        windows sit at their stock $1F9C0-$1FFFF; 1 = they
+//                        decode at $7F9C0-$7FFFF instead (same [16:0]
+//                        offsets, top of the 512 KB space, inside the
+//                        unpopulated region), freeing the whole 352 KB as
+//                        plain VRAM. Bits [7:1] reserved, write 0, read 0.
+//   $9F2A-$9F2C     reserved (read the version bytes today; do not rely)
+// Relocated windows are WRITE-ONLY: stock readback was only ever the VRAM
+// shadow underneath the window, and there is no memory under the high
+// position, so reads there return $00 (the section 3 hole rule) -- which
+// vram_at() already implements.
+#define VERA816_CTRL_DCSEL   34
+static bool vera816_regwin_hi;
 static uint8_t  blt_idx;           // BLT_IDX; 4 bits, like top.v's blt_idx_r
 static uint32_t blt_src;           // 19-bit VRAM byte address
 static uint32_t blt_dst;           // 19-bit VRAM byte address
@@ -265,6 +280,7 @@ video_reset()
 	io_dcsel = 0;
 	vera816_basex[0] = 0;
 	vera816_basex[1] = 0;
+	vera816_regwin_hi = false;
 	blt_idx = 0;
 	blt_src = 0;
 	blt_dst = 0;
@@ -1794,21 +1810,41 @@ video_space_read_range(uint8_t* dest, uint32_t address, uint32_t size)
 	}
 }
 
+// The PSG/palette/sprite-attribute window decode, shared by every CPU-side
+// write path (video_space_write and fx_video_space_write -- the RTL has ONE
+// such decode, on ib traffic in top.v, so the emulator must not grow two
+// that can disagree).
+//
+// VERA816 CTRL816.REGWIN (doc/VERA816.md section 4.4): with the bit set, the
+// windows decode at $7F9C0-$7FFFF instead of $1F9C0-$1FFFF -- same [16:0]
+// offsets, so only the range checks move ($1F9C0 + $60000). The register
+// index arithmetic is offset-invariant, and the callers' vram_at() write
+// self-discards for the relocated position (it is inside the unpopulated
+// hole), which is what makes the relocated windows write-only, exactly as on
+// the RTL. With the bit clear the stock ranges apply and the freed
+// $1F9C0-$1FFFF is plain VRAM, updated by the vram_at() write alone.
+static void
+vera_window_write(uint32_t address, uint8_t value)
+{
+	uint32_t woff = vera816_regwin_hi ? 0x60000 : 0;
+
+	if (address >= ADDR_PSG_START + woff && address < ADDR_PSG_END + woff) {
+		audio_render();
+		psg_writereg(address & 0x3f, value);
+	} else if (address >= ADDR_PALETTE_START + woff && address < ADDR_PALETTE_END + woff) {
+		palette[address & 0x1ff] = value;
+		video_palette.dirty = true;
+	} else if (address >= ADDR_SPRDATA_START + woff && address < ADDR_SPRDATA_END + woff) {
+		sprite_data[(address >> 3) & 0x7f][address & 0x7] = value;
+		refresh_sprite_properties((address >> 3) & 0x7f);
+	}
+}
+
 void
 video_space_write(uint32_t address, uint8_t value)
 {
 	(*vram_at(address)) = value;
-
-	if (address >= ADDR_PSG_START && address < ADDR_PSG_END) {
-		audio_render();
-		psg_writereg(address & 0x3f, value);
-	} else if (address >= ADDR_PALETTE_START && address < ADDR_PALETTE_END) {
-		palette[address & 0x1ff] = value;
-		video_palette.dirty = true;
-	} else if (address >= ADDR_SPRDATA_START && address < ADDR_SPRDATA_END) {
-		sprite_data[(address >> 3) & 0x7f][address & 0x7] = value;
-		refresh_sprite_properties((address >> 3) & 0x7f);
-	}
+	vera_window_write(address, value);
 }
 
 //
@@ -1919,16 +1955,7 @@ fx_video_space_write(uint32_t address, bool nibble, uint8_t value)
 	} else {
 		if (!fx_trans_writes || value > 0) (*vram_at(address)) = value;
 	}
-	if (address >= ADDR_PSG_START && address < ADDR_PSG_END) {
-		audio_render();
-		psg_writereg(address & 0x3f, value);
-	} else if (address >= ADDR_PALETTE_START && address < ADDR_PALETTE_END) {
-		palette[address & 0x1ff] = value;
-		video_palette.dirty = true;
-	} else if (address >= ADDR_SPRDATA_START && address < ADDR_SPRDATA_END) {
-		sprite_data[(address >> 3) & 0x7f][address & 0x7] = value;
-		refresh_sprite_properties((address >> 3) & 0x7f);
-	}
+	vera_window_write(address, value);
 }
 
 void
@@ -2220,6 +2247,13 @@ uint8_t video_read(uint8_t reg, bool debugOn) {
 				}
 			}
 
+			// VERA816 control bank (doc/VERA816.md section 4.4). Only $9F29
+			// is defined; $9F2A-$9F2C fall through to the version bytes,
+			// exactly as in top.v's read mux.
+			if (io_dcsel == VERA816_CTRL_DCSEL && reg == 0x09) {
+				return vera816_regwin_hi ? 0x01 : 0x00;    // CTRL816
+			}
+
 			if (debugOn) return video_get_dc_value(i);
 			switch (i) {
 				case 0x00:
@@ -2480,6 +2514,14 @@ void video_write(uint8_t reg, uint8_t value) {
 					case 0x0C: break;                   // $9F2C BLT_ID: read-only
 				}
 				return;
+			}
+
+			// VERA816 control bank (doc/VERA816.md section 4.4)
+			if (io_dcsel == VERA816_CTRL_DCSEL) {
+				if (reg == 0x09) {                  // $9F29 CTRL816
+					vera816_regwin_hi = (value & 0x01) != 0;
+				}
+				return;                             // $9F2A-$9F2C: reserved, ignored
 			}
 
 			if (i == 0) {
