@@ -244,6 +244,17 @@ write6502(uint16_t address, uint8_t bank, uint8_t value)
 	open_bus = value;
 
 	if (bank != 0) {                              // $01:0000-$FF:FFFF
+		// Firmware write-protect (core doc/KERNEL.md section 3; x816.sv
+		// "fw_region"): banks $F0-$FF hold the HPS-loaded kernel and CPU
+		// stores there are SILENTLY DROPPED -- on hardware the region gets
+		// no chip select for a store, so the write vanishes with no error.
+		// Reads are unrestricted. The loader paths bypass this by
+		// construction, exactly as the HPS/SD-DMA ports do in the RTL:
+		// -load (memory_load_flat) and the SD DMA (sdblock.c) write RAM[]
+		// directly and never come through here.
+		if (bank >= X816_FW_FIRST_BANK) {
+			return;
+		}
 		RAM[((uint32_t)bank << 16) | address] = value;
 		return;
 	}

@@ -28,6 +28,11 @@
 #define X816_BOOT_BASE  0xFF00u      // bank $00 only
 #define X816_BOOT_SIZE  0x100u
 
+// The firmware region: banks $F0-$FF, $F0:0000-$FF:FFFF. HPS-loaded kernel,
+// write-protected against CPU stores (core doc/KERNEL.md section 3, x816.sv
+// "fw_region"). Reads are unrestricted; loader paths bypass the protection.
+#define X816_FW_FIRST_BANK 0xF0u
+
 // SYSCTL, bank $00
 #define X816_SYSCTL         0x9F80u
 #define X816_SYSCTL_LAST    0x9F8Fu

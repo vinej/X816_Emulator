@@ -125,6 +125,26 @@ static uint8_t io_dcsel;
 #define VERA816_DCSEL 32
 static uint8_t vera816_basex[2];   // per layer: [1:0] MAPBASE[9:8], [3:2] TILEBASE[9:8]
 
+// VERA816 blitter bank, DCSEL=33 (doc/VERA816.md section 4.3, normative;
+// RTL: blit816.v + the DCSEL-33 decode in top.v):
+//   $9F29 BLT_IDX   R/W  index into the parameter file, 0-9
+//   $9F2A BLT_DATA  R/W  the indexed parameter byte; a WRITE auto-increments
+//                        BLT_IDX, a read does not
+//   $9F2B BLT_CTRL  W    bit 0 = start COPY, bit 1 = start FILL
+//                   R    bit 0 = busy
+//   $9F2C BLT_ID    R    $B6 -- feature detect (stock VERA reads the version
+//                        byte here)
+// Parameter file: 0-2 SRC, 3-5 DST, 6-8 LEN (19-bit little-endian, byte
+// addresses / byte count, [18:16] in the low bits of the third byte), 9 = the
+// FILL value.
+#define VERA816_BLT_DCSEL    33
+#define VERA816_BLT_ID_VALUE 0xB6
+static uint8_t  blt_idx;           // BLT_IDX; 4 bits, like top.v's blt_idx_r
+static uint32_t blt_src;           // 19-bit VRAM byte address
+static uint32_t blt_dst;           // 19-bit VRAM byte address
+static uint32_t blt_len;           // 19-bit byte count
+static uint8_t  blt_val;           // FILL byte
+
 static uint8_t ien;
 static uint8_t isr;
 
@@ -245,6 +265,11 @@ video_reset()
 	io_dcsel = 0;
 	vera816_basex[0] = 0;
 	vera816_basex[1] = 0;
+	blt_idx = 0;
+	blt_src = 0;
+	blt_dst = 0;
+	blt_len = 0;
+	blt_val = 0;
 	io_rddata[0] = 0;
 	io_rddata[1] = 0;
 
@@ -635,7 +660,14 @@ refresh_sprite_properties(const uint16_t sprite)
 	props->vflip = (sprite_data[sprite][6] >> 1) & 1;
 
 	props->color_mode     = (sprite_data[sprite][1] >> 7) & 1;
-	props->sprite_address = sprite_data[sprite][0] << 5 | (sprite_data[sprite][1] & 0xf) << 13;
+	// VERA816 (doc/VERA816.md section 5.1, normative): sprite attribute
+	// byte 1 bits [5:4] -- formerly reserved, write-0 -- are VRAM byte
+	// address bits [18:17], so sprite data can live above 128 KB. Bit 6
+	// stays reserved. Granularity stays 32 bytes, and software that writes
+	// the reserved bits as zero sees exactly stock behaviour.
+	props->sprite_address = ((uint32_t)sprite_data[sprite][0] << 5)
+	                      | ((uint32_t)(sprite_data[sprite][1] & 0xf) << 13)
+	                      | ((uint32_t)((sprite_data[sprite][1] >> 4) & 0x3) << 17);
 
 	props->palette_offset = (sprite_data[sprite][7] & 0x0f) << 4;
 }
@@ -718,10 +750,22 @@ render_sprite_line(const uint16_t y)
 		int16_t       eff_sx      = (props->hflip ? (props->sprite_width - 1) : 0);
 		const int16_t eff_sx_incr = props->hflip ? -1 : 1;
 
-		const uint8_t *bitmap_data = video_ram + props->sprite_address + (eff_sy << (props->sprite_width_log2 - (1 - props->color_mode)));
+		// VERA816: with the section 5.1 widening the sprite address is a
+		// 19-bit byte address, so a line's data can sit in -- or run into --
+		// the unpopulated $58000-$7FFFF region, which reads $00 and has no
+		// storage behind it (the backing array is only 352 KB). Fetch each
+		// byte through video_space_read instead of aiming a raw pointer into
+		// video_ram: that gives the hole its read-0 semantics and wraps the
+		// address modulo 512 KB like every other VRAM access.
+		const uint32_t line_addr = props->sprite_address + ((uint32_t)eff_sy << (props->sprite_width_log2 - (1 - props->color_mode)));
 
+		uint8_t bitmap_data[64];
 		uint8_t unpacked_sprite_line[64];
 		const uint16_t width = (props->sprite_width<64? props->sprite_width : 64);
+		const uint16_t line_bytes = (props->color_mode == 0) ? (width >> 1) : width;
+		for (uint16_t b = 0; b < line_bytes; ++b) {
+			bitmap_data[b] = video_space_read(line_addr + b);
+		}
 		const uint8_t vram_fetch_mask = ((2 - props->color_mode) << 2) - 1;
 		if (props->color_mode == 0) {
 			// 4bpp
@@ -1767,6 +1811,97 @@ video_space_write(uint32_t address, uint8_t value)
 	}
 }
 
+//
+// VERA816 blitter engine (doc/VERA816.md section 4.3; RTL: blit816.v)
+//
+
+// BLT_DATA read: the indexed parameter byte. Mirrors blit816.v's readback
+// mux exactly: the [18:16] bytes (indexes 2/5/8) read back with their top
+// five bits 0, and indexes 10-15 read $00.
+static uint8_t
+blt_param_read(void)
+{
+	switch (blt_idx) {
+		case 0:  return blt_src & 0xff;
+		case 1:  return (blt_src >> 8) & 0xff;
+		case 2:  return (blt_src >> 16) & 0x07;
+		case 3:  return blt_dst & 0xff;
+		case 4:  return (blt_dst >> 8) & 0xff;
+		case 5:  return (blt_dst >> 16) & 0x07;
+		case 6:  return blt_len & 0xff;
+		case 7:  return (blt_len >> 8) & 0xff;
+		case 8:  return (blt_len >> 16) & 0x07;
+		case 9:  return blt_val;
+		default: return 0x00;
+	}
+}
+
+// BLT_DATA write: the indexed parameter byte. Mirrors blit816.v: only bits
+// [2:0] land for the [18:16] bytes, indexes 10-15 are ignored. The RTL also
+// ignores parameter writes while busy; here a blit completes before the CPU
+// can issue another access, so "while busy" is unreachable (see blt_start).
+static void
+blt_param_write(uint8_t value)
+{
+	switch (blt_idx) {
+		case 0: blt_src = (blt_src & 0x7ff00) | value;                            break;
+		case 1: blt_src = (blt_src & 0x700ff) | ((uint32_t)value << 8);           break;
+		case 2: blt_src = (blt_src & 0x0ffff) | ((uint32_t)(value & 0x07) << 16); break;
+		case 3: blt_dst = (blt_dst & 0x7ff00) | value;                            break;
+		case 4: blt_dst = (blt_dst & 0x700ff) | ((uint32_t)value << 8);           break;
+		case 5: blt_dst = (blt_dst & 0x0ffff) | ((uint32_t)(value & 0x07) << 16); break;
+		case 6: blt_len = (blt_len & 0x7ff00) | value;                            break;
+		case 7: blt_len = (blt_len & 0x700ff) | ((uint32_t)value << 8);           break;
+		case 8: blt_len = (blt_len & 0x0ffff) | ((uint32_t)(value & 0x07) << 16); break;
+		case 9: blt_val = value;                                                  break;
+		default: break;
+	}
+}
+
+// BLT_CTRL start. The RTL engine consumes idle VRAM slots and takes real
+// time (~3-6 ms for a full frame); the emulator is PERMITTED by VERA816.md
+// section 4.3 to complete the whole operation instantaneously, which is what
+// happens here: by the time the CPU can read BLT_CTRL, busy (bit 0) is 0
+// again, so polling loops still terminate on their first poll, and
+// "parameter writes while busy are ignored" is trivially satisfied.
+//
+// The blitter's memory traffic goes through its own VRAM port straight to
+// the memory (vram_if if4), NOT through the CPU data port: plain byte
+// accesses with no FX transparency, no 4-bit mode, no cache interaction --
+// and no PSG/palette/sprite-attribute shadow update either, exactly as on
+// the RTL, where those shadows are written only by the external-bus decode
+// in top.v. vram_at() supplies the section 3 hole semantics (reads return
+// 0, writes are discarded) and the 19-bit masking.
+static void
+blt_start(bool fill)
+{
+	// LEN = 0 starts nothing -- busy never rises, and SRC/DST/LEN are left
+	// exactly as they were.
+	if (fill) {
+		// FILL advances DST only; SRC is untouched (blit816.v steps src_r
+		// only on COPY).
+		while (blt_len != 0) {
+			*vram_at(blt_dst) = blt_val;
+			blt_dst = (blt_dst + 1) & VERA816_ADDR_MASK;   // wrap mod 512 KB
+			blt_len--;
+		}
+	} else {
+		// COPY is ASCENDING and byte-granular. Overlap is defined only for
+		// DST < SRC or disjoint ranges; the VERA2 "doubling" idiom
+		// (DST = SRC + LEN) is disjoint and is the intended fast-fill
+		// pattern.
+		while (blt_len != 0) {
+			uint8_t v = *vram_at(blt_src);                 // hole reads 0
+			*vram_at(blt_dst) = v;                         // hole write discarded
+			blt_src = (blt_src + 1) & VERA816_ADDR_MASK;
+			blt_dst = (blt_dst + 1) & VERA816_ADDR_MASK;
+			blt_len--;
+		}
+	}
+	// SRC/DST/LEN now read back as the engine left them: LEN = 0, pointers
+	// one-past-end -- the readable-pointer convention VERA2 established.
+}
+
 
 void
 fx_video_space_write(uint32_t address, bool nibble, uint8_t value)
@@ -2070,6 +2205,21 @@ uint8_t video_read(uint8_t reg, bool debugOn) {
 				}
 			}
 
+			// VERA816 blitter bank (doc/VERA816.md section 4.3). None of
+			// these reads has side effects -- BLT_DATA reads do NOT
+			// auto-increment BLT_IDX (only writes do) -- so debug reads take
+			// the same path.
+			if (io_dcsel == VERA816_BLT_DCSEL) {
+				switch (reg) {
+					case 0x09: return blt_idx;              // BLT_IDX (4-bit; upper bits 0, as in top.v)
+					case 0x0A: return blt_param_read();     // BLT_DATA
+					case 0x0B: return 0x00;                 // BLT_CTRL: bit 0 = busy; the engine
+					                                        // completes instantaneously, so busy
+					                                        // always reads 0 (see blt_start)
+					case 0x0C: return VERA816_BLT_ID_VALUE; // BLT_ID = $B6, feature detect
+				}
+			}
+
 			if (debugOn) return video_get_dc_value(i);
 			switch (i) {
 				case 0x00:
@@ -2301,6 +2451,33 @@ void video_write(uint8_t reg, uint8_t value) {
 					case 0x0A: vera816_basex[0] = value & 0x0f; break;  // $9F2A L0_BASEX
 					case 0x0B: vera816_basex[1] = value & 0x0f; break;  // $9F2B L1_BASEX
 					case 0x0C: break;                                   // $9F2C VRAMCAP: read-only
+				}
+				return;
+			}
+
+			// VERA816 blitter bank (doc/VERA816.md section 4.3)
+			if (io_dcsel == VERA816_BLT_DCSEL) {
+				switch (reg) {
+					case 0x09:                          // $9F29 BLT_IDX
+						blt_idx = value & 0x0f;         // top.v latches write_data[3:0]
+						break;
+					case 0x0A:                          // $9F2A BLT_DATA
+						blt_param_write(value);
+						// A WRITE auto-increments BLT_IDX (reads do not).
+						// 4-bit wrap, exactly as top.v's blt_idx_r + 1.
+						blt_idx = (blt_idx + 1) & 0x0f;
+						break;
+					case 0x0B:                          // $9F2B BLT_CTRL
+						// bit 0 = start COPY, bit 1 = start FILL. If both
+						// are set FILL wins, as in blit816.v
+						// (op_fill_r <= start_fill).
+						if (value & 0x02) {
+							blt_start(true);
+						} else if (value & 0x01) {
+							blt_start(false);
+						}
+						break;
+					case 0x0C: break;                   // $9F2C BLT_ID: read-only
 				}
 				return;
 			}

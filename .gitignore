@@ -14,3 +14,7 @@ build/
 
 # A second CMake tree, used when the Makefile cannot find MinGW.
 build2/
+
+# A third CMake tree, used to build a candidate while the tests kept running
+# against build/.
+build-parity/
