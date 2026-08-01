@@ -279,18 +279,38 @@ handle_keyboard(bool down, SDL_Keycode sym, SDL_Scancode scancode)
 static const unsigned char autokey_ascii[64] = {
 	0,    0,    '1',  '2',  '3',  '4',  '5',  '6',
 	'7',  '8',  '9',  '0',  '-',  '=',  0,    0x08,
-	0x09, 'Q',  'W',  'E',  'R',  'T',  'Y',  'U',
-	'I',  'O',  'P',  '[',  ']',  92,   0,    'A',
-	'S',  'D',  'F',  'G',  'H',  'J',  'K',  'L',
-	';',  39,   0,    0x0D, 0,    0,    'Z',  'X',
-	'C',  'V',  'B',  'N',  'M',  ',',  '.',  '/',
+	0x09, 'q',  'w',  'e',  'r',  't',  'y',  'u',
+	'i',  'o',  'p',  '[',  ']',  92,   0,    'a',
+	's',  'd',  'f',  'g',  'h',  'j',  'k',  'l',
+	';',  39,   0,    0x0D, 0,    0,    'z',  'x',
+	'c',  'v',  'b',  'n',  'm',  ',',  '.',  '/',
 	0,    0,    0,    0,    0,    ' ',  0,    0
 };
 
+/* Shifted, US layout -- the same table X816_Calypsi runtime/font8x8.c decodes
+   with. A character reachable only with Shift has to be typed WITH Shift, or
+   the shift path is never exercised and ':' cannot be sent at all. */
+static const unsigned char autokey_shift[64] = {
+	0,    0,    '!',  '@',  '#',  '$',  '%',  '^',
+	'&',  '*',  '(',  ')',  '_',  '+',  0,    0x08,
+	0x09, 'Q',  'W',  'E',  'R',  'T',  'Y',  'U',
+	'I',  'O',  'P',  '{',  '}',  '|',  0,    'A',
+	'S',  'D',  'F',  'G',  'H',  'J',  'K',  'L',
+	':',  '"',  0,    0x0D, 0,    0,    'Z',  'X',
+	'C',  'V',  'B',  'N',  'M',  '<',  '>',  '?',
+	0,    0,    0,    0,    0,    ' ',  0,    0
+};
+
+#define AUTOKEY_LSHIFT 44
+
 static const char *autokeys_text = NULL;
 static uint32_t    autokeys_timer = 0;
-static bool        autokeys_release = false;
 static uint8_t     autokeys_pending = 0;
+static bool        autokeys_shifted = false;
+/* 0 = fetch the next character, then 1..4 walk the make/break sequence. A
+   shifted character is four events, not two, and the shift key has to bracket
+   the other one for the guest to see them in the right order. */
+static uint8_t     autokeys_phase = 0;
 
 /* Roughly 25 ms of an 8 MHz clock between events. Fast enough that a test
    finishes in seconds, slow enough that a program polling the SMC in a loop
@@ -302,7 +322,8 @@ autokeys_set(const char *text)
 {
 	autokeys_text    = text;
 	autokeys_timer   = AUTOKEYS_INTERVAL * 20;   /* let the program start up */
-	autokeys_release = false;
+	autokeys_phase   = 0;
+	autokeys_shifted = false;
 }
 
 void
@@ -321,11 +342,23 @@ autokeys_step(uint32_t clocks)
 
 	/* Every press is followed by its release, exactly as a real keyboard does.
 	   Skipping the release would leave code that filters bit 7 untested, which
-	   is precisely the kind of gap that put us here. */
-	if (autokeys_release) {
-		i2c_kbd_buffer_add(autokeys_pending | 0x80);
-		autokeys_release = false;
+	   is precisely the kind of gap that put us here -- and it would leave Shift
+	   stuck down for ever, since a modifier IS the gap between its two edges. */
+	switch (autokeys_phase) {
+	case 1:                                 /* key down */
+		i2c_kbd_buffer_add(autokeys_pending);
+		autokeys_phase = 2;
 		return;
+	case 2:                                 /* key up */
+		i2c_kbd_buffer_add(autokeys_pending | 0x80);
+		autokeys_phase = autokeys_shifted ? 3 : 0;
+		return;
+	case 3:                                 /* shift up, last */
+		i2c_kbd_buffer_add(AUTOKEY_LSHIFT | 0x80);
+		autokeys_phase = 0;
+		return;
+	default:
+		break;
 	}
 
 	if (!*autokeys_text) {
@@ -339,21 +372,38 @@ autokeys_step(uint32_t clocks)
 		c = 0x0D;
 	} else if (c == '\n') {
 		c = 0x0D;
-	} else if (c >= 'a' && c <= 'z') {
-		c = (unsigned char)(c - 32);              /* the table is upper case */
 	}
+	/* No folding: the unshifted table is lower case now, so an upper-case
+	   character is found on the SHIFTED layer and typed with Shift held --
+	   which is what a person does, and what exercises the modifier. */
 
 	code = -1;
+	autokeys_shifted = false;
 	for (i = 0; i < 64; i++) {
 		if (autokey_ascii[i] == c) {
 			code = i;
 			break;
 		}
 	}
+	if (code < 0) {
+		/* Not on the unshifted layer -- try the shifted one. */
+		for (i = 0; i < 64; i++) {
+			if (autokey_shift[i] == c) {
+				code = i;
+				autokeys_shifted = true;
+				break;
+			}
+		}
+	}
 	if (code < 0)
 		return;                                   /* not typeable: skip it */
 
-	i2c_kbd_buffer_add((uint8_t)code);
 	autokeys_pending = (uint8_t)code;
-	autokeys_release = true;
+	if (autokeys_shifted) {
+		i2c_kbd_buffer_add(AUTOKEY_LSHIFT);       /* shift down first */
+		autokeys_phase = 1;
+	} else {
+		i2c_kbd_buffer_add(autokeys_pending);
+		autokeys_phase = 2;
+	}
 }

@@ -8,3 +8,6 @@ src/x16edit_E_labels.h
 .idea/
 /build
 build/
+
+# Test recordings: every -gif run drops one of these in the tree.
+*.gif
