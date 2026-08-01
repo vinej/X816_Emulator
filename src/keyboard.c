@@ -276,32 +276,53 @@ handle_keyboard(bool down, SDL_Keycode sym, SDL_Scancode scancode)
    Deliberately identical to X816_Calypsi runtime/font8x8.c keymap[64], because
    a test that used a DIFFERENT table would prove the table rather than the
    path. */
-/* Index 1 is the ESC key. It used to be 0 -- unmapped -- which meant a test
-   whose only way out was ESC could not be driven headlessly at all, and the
-   recovery path would have gone to hardware unexercised. */
-static const unsigned char autokey_ascii[64] = {
-	0,    0x1B, '1',  '2',  '3',  '4',  '5',  '6',
+/* These are IBM KEY POSITION NUMBERS, matching keynum_from_SDL_Scancode
+   above -- position 1 is the grave key, not ESC. Both tables run to 128
+   because the keys worth typing in a test that are NOT on the typewriter
+   block live above 63: ESCAPE is 110. Sized at 64 they could not express it,
+   and putting ESC at index 1 to work around that made the grave key send an
+   escape instead. */
+static const unsigned char autokey_ascii[128] = {
+	0,    '`',  '1',  '2',  '3',  '4',  '5',  '6',
 	'7',  '8',  '9',  '0',  '-',  '=',  0,    0x08,
 	0x09, 'q',  'w',  'e',  'r',  't',  'y',  'u',
 	'i',  'o',  'p',  '[',  ']',  92,   0,    'a',
 	's',  'd',  'f',  'g',  'h',  'j',  'k',  'l',
 	';',  39,   0,    0x0D, 0,    0,    'z',  'x',
 	'c',  'v',  'b',  'n',  'm',  ',',  '.',  '/',
-	0,    0,    0,    0,    0,    ' ',  0,    0
+	0,    0,    0,    0,    0,    ' ',  0,    0,
+	/* ---- 64..127: not on the typewriter block ---------------------- */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  64 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  72 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  80 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  88 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  96 */
+	0,    0,    0,    0,    0,    0,    0x1B, 0,    /* 104; 110 = ESCAPE */
+	0,    0,    0,    0,    0,    0,    0,    0,    /* 112 */
+	0,    0,    0,    0,    0,    0,    0,    0     /* 120 */
 };
 
 /* Shifted, US layout -- the same table X816_Calypsi runtime/font8x8.c decodes
    with. A character reachable only with Shift has to be typed WITH Shift, or
    the shift path is never exercised and ':' cannot be sent at all. */
-static const unsigned char autokey_shift[64] = {
-	0,    0x1B, '!',  '@',  '#',  '$',  '%',  '^',
+static const unsigned char autokey_shift[128] = {
+	0,    '~',  '!',  '@',  '#',  '$',  '%',  '^',
 	'&',  '*',  '(',  ')',  '_',  '+',  0,    0x08,
 	0x09, 'Q',  'W',  'E',  'R',  'T',  'Y',  'U',
 	'I',  'O',  'P',  '{',  '}',  '|',  0,    'A',
 	'S',  'D',  'F',  'G',  'H',  'J',  'K',  'L',
 	':',  '"',  0,    0x0D, 0,    0,    'Z',  'X',
 	'C',  'V',  'B',  'N',  'M',  '<',  '>',  '?',
-	0,    0,    0,    0,    0,    ' ',  0,    0
+	0,    0,    0,    0,    0,    ' ',  0,    0,
+	/* ---- 64..127: not on the typewriter block ---------------------- */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  64 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  72 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  80 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  88 */
+	0,    0,    0,    0,    0,    0,    0,    0,    /*  96 */
+	0,    0,    0,    0,    0,    0,    0x1B, 0,    /* 104; 110 = ESCAPE */
+	0,    0,    0,    0,    0,    0,    0,    0,    /* 112 */
+	0,    0,    0,    0,    0,    0,    0,    0     /* 120 */
 };
 
 #define AUTOKEY_LSHIFT 44
@@ -382,7 +403,7 @@ autokeys_step(uint32_t clocks)
 
 	code = -1;
 	autokeys_shifted = false;
-	for (i = 0; i < 64; i++) {
+	for (i = 0; i < 128; i++) {
 		if (autokey_ascii[i] == c) {
 			code = i;
 			break;
@@ -390,7 +411,7 @@ autokeys_step(uint32_t clocks)
 	}
 	if (code < 0) {
 		/* Not on the unshifted layer -- try the shifted one. */
-		for (i = 0; i < 64; i++) {
+		for (i = 0; i < 128; i++) {
 			if (autokey_shift[i] == c) {
 				code = i;
 				autokeys_shifted = true;
