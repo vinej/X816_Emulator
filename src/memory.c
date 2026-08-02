@@ -49,6 +49,14 @@ static bool    boot_rom_loaded = false;
 // reads until software clears it -- see boot/boot.s in the core repo.
 static bool sysctl_overlay = true;
 
+// The $9F90 millisecond timer's state. Declared up here so memory_reset can
+// clear it: in the RTL it is reset by cpu_reset_n like everything else, and a
+// clock that survived reset in one implementation but not the other would be
+// exactly the kind of quiet divergence this file's header warns about.
+static uint32_t timer_ms    = 0;
+static uint32_t timer_div   = 0;
+static uint32_t timer_latch = 0;
+
 // Floating-bus emulation. The RTL keeps the last byte transferred on the bus
 // and returns it for unmapped reads:
 //     always @(posedge cpu_clk) if (cpu_rdy) open_bus_r <= cpu_rwn ? cpu_di : cpu_do;
@@ -101,6 +109,7 @@ memory_reset()
 {
 	sysctl_overlay = true;
 	open_bus = 0;
+	timer_ms = timer_div = timer_latch = 0;
 }
 
 bool
@@ -146,6 +155,47 @@ void memory_report_usage_statistics(const char *filename) { reportUsageStatistic
 void memory_randomize_ram(bool value) { randomizeRAM = value; }
 
 // ---------------------------------------------------------------------------
+// Free-running millisecond timer, $9F90-$9F93 (little-endian).
+//
+// x816.sv counts cpu_clk cycles and divides by X816_TIMER_DIV, gated by
+// nothing -- not cpu_rdy, not a chip select -- because both VIAs stop dead
+// during an SD transfer (doc/AUDIT.md L-4) and VERA's VSYNC latch collapses a
+// multi-frame freeze into one tick. This mirrors that: the divider runs off
+// the same CPU-clock delta the rest of the main loop is driven by.
+//
+// The LATCH is normative, not an optimisation. Reading the low byte at $9F90
+// captures bits 31:8, and $9F91-$9F93 return that capture -- so software must
+// read $9F90 FIRST. Without it a read straddling a carry returns a value that
+// was never true and can go backwards. The emulator implements it because
+// software that gets the order wrong must break HERE, where it is cheap to
+// find, and not only on hardware.
+// ---------------------------------------------------------------------------
+void
+timer_step(uint32_t clocks)
+{
+	timer_div += clocks;
+	while (timer_div >= X816_TIMER_DIV) {
+		timer_div -= X816_TIMER_DIV;
+		timer_ms++;
+	}
+}
+
+static uint8_t
+timer_read(uint8_t reg, bool debugOn)
+{
+	switch (reg & 3) {
+		case 0:
+			// The debugger's memory view must not disturb the machine it is
+			// looking at -- same rule the SD block device follows.
+			if (!debugOn) timer_latch = timer_ms >> 8;
+			return timer_ms & 0xff;
+		case 1: return timer_latch & 0xff;
+		case 2: return (timer_latch >> 8) & 0xff;
+		default: return (timer_latch >> 16) & 0xff;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // I/O page, bank $00 only. Layout is deliberately identical to the Commander
 // X16's so VERA/VIA/YM register offsets and drivers port over unchanged.
 // ---------------------------------------------------------------------------
@@ -167,6 +217,8 @@ io_read(uint16_t address, bool debugOn)
 			     | (regs.e ? X816_SYSCTL_EMU : 0);
 		}
 		return sdblock_read(address & 0xf, debugOn);  // $9F81-$9F8B  SD
+	} else if (address >= X816_TIMER && address <= X816_TIMER_LAST) {
+		return timer_read(address & 3, debugOn);      // $9F90-$9F93  ms counter
 	} else if (address >= DEVICE_EMULATOR && address < DEVICE_EMULATOR + 0x10) {
 		// EMULATOR-ONLY. The RTL treats $9F90-$9FFF as open bus, so this device
 		// does not exist on hardware. Guest software must not depend on it.

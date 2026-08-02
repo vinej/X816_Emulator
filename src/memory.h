@@ -107,4 +107,10 @@ uint8_t memory_get_rom_bank();
 uint8_t emu_read(uint8_t reg, bool debugOn);
 void emu_write(uint8_t reg, uint8_t value);
 
+// ---- the free-running millisecond timer, $9F90-$9F93 -----------------------
+// Advanced from the main loop's CPU-clock delta, which is what makes it the
+// same counter the RTL has: x816.sv divides cpu_clk by X816_TIMER_DIV and is
+// gated by nothing at all. Call it every step, before anything reads $9F90.
+void timer_step(uint32_t clocks);
+
 #endif

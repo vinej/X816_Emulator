@@ -1811,6 +1811,7 @@ emulator_loop(void *param)
 		old_clockticks6502 = clockticks6502;
 		bool new_frame = false;
 		via1_step(clocks);
+		timer_step(clocks);
 		vera_spi_step(MHZ, clocks);
 		if (has_serial) {
 			serial_step(clocks);
