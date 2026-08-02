@@ -23,21 +23,16 @@
 #define BANK_SIZE 65536
 
 // ---- X816 flat map ---------------------------------------------------------
+// The map itself -- X816_IO_PAGE, X816_BOOT_BASE/SIZE, X816_SYSCTL and its
+// bits, X816_FW_FIRST_BANK, the SD register block, the load bases and the
+// kernel ABI -- is GENERATED from X816_core/tools/contract.py, the same table
+// the core's boot.s and the Calypsi runtime take theirs from. This file used
+// to carry its own copy; `python tools/contract.py --check` in the core repo
+// is what now proves the emulator's map is the core's map rather than merely
+// resembling it.
+#include "x816_contract.h"
+
 #define X816_RAM_SIZE   0x1000000u   // 16 MB, $00:0000-$FF:FFFF
-#define X816_IO_PAGE    0x9F00u      // bank $00 only
-#define X816_BOOT_BASE  0xFF00u      // bank $00 only
-#define X816_BOOT_SIZE  0x100u
-
-// The firmware region: banks $F0-$FF, $F0:0000-$FF:FFFF. HPS-loaded kernel,
-// write-protected against CPU stores (core doc/KERNEL.md section 3, x816.sv
-// "fw_region"). Reads are unrestricted; loader paths bypass the protection.
-#define X816_FW_FIRST_BANK 0xF0u
-
-// SYSCTL, bank $00
-#define X816_SYSCTL         0x9F80u
-#define X816_SYSCTL_LAST    0x9F8Fu
-#define X816_SYSCTL_OVERLAY 0x01     // bit 0: boot ROM overlay enable (1 at reset)
-#define X816_SYSCTL_EMU     0x02     // bit 1: CPU E flag, read-only
 
 // x16emu's debug device. $9F90-$9FFF is open bus in the X816 map, so this
 // range is free; kept at the same address so existing tooling still works.

@@ -2482,8 +2482,22 @@ void video_write(uint8_t reg, uint8_t value) {
 						io_addr[0] = (io_addr[0] & 0x1ffff) | ((uint32_t)(value & 0x03) << 17);
 						io_addr[1] = (io_addr[1] & 0x1ffff) | ((uint32_t)((value >> 2) & 0x03) << 17);
 						break;
-					case 0x0A: vera816_basex[0] = value & 0x0f; break;  // $9F2A L0_BASEX
-					case 0x0B: vera816_basex[1] = value & 0x0f; break;  // $9F2B L1_BASEX
+					// The layer's cached properties MUST be refreshed here.
+					// map_base and tile_base are computed once, in
+					// refresh_layer_properties, which is otherwise only
+					// reached from a write to $9F2D-$9F33 / $9F34-$9F3A. A
+					// program that sets MAPBASE/TILEBASE and then extends
+					// them with BASEX -- the natural order, and the one
+					// examples/vera/scanout.c uses -- would leave the cache
+					// holding the un-extended base, so the layer renders
+					// from the low 128 KB while the CPU port writes where it
+					// was told. The RTL has no such cache and was correct
+					// throughout; this was emulator-only, the mirror image
+					// of AUDIT.md H-3 and H-4.
+					case 0x0A: vera816_basex[0] = value & 0x0f;         // $9F2A L0_BASEX
+					           refresh_layer_properties(0); break;
+					case 0x0B: vera816_basex[1] = value & 0x0f;         // $9F2B L1_BASEX
+					           refresh_layer_properties(1); break;
 					case 0x0C: break;                                   // $9F2C VRAMCAP: read-only
 				}
 				return;
