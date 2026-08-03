@@ -1,0 +1,27 @@
+/* Stub: no X16 ROM on X816; trace labels come back empty. */
+static uint16_t addresses_bank0[] = { 0xFFFF };
+static char *labels_bank0[] = { "" };
+static uint16_t addresses_bank1[] = { 0xFFFF };
+static char *labels_bank1[] = { "" };
+static uint16_t addresses_bank2[] = { 0xFFFF };
+static char *labels_bank2[] = { "" };
+static uint16_t addresses_bank3[] = { 0xFFFF };
+static char *labels_bank3[] = { "" };
+static uint16_t addresses_bank4[] = { 0xFFFF };
+static char *labels_bank4[] = { "" };
+static uint16_t addresses_bank5[] = { 0xFFFF };
+static char *labels_bank5[] = { "" };
+static uint16_t addresses_bank6[] = { 0xFFFF };
+static char *labels_bank6[] = { "" };
+static uint16_t addresses_bankA[] = { 0xFFFF };
+static char *labels_bankA[] = { "" };
+static uint16_t addresses_bankB[] = { 0xFFFF };
+static char *labels_bankB[] = { "" };
+static uint16_t addresses_bankC[] = { 0xFFFF };
+static char *labels_bankC[] = { "" };
+static uint16_t addresses_bankD[] = { 0xFFFF };
+static char *labels_bankD[] = { "" };
+static uint16_t addresses_bankE[] = { 0xFFFF };
+static char *labels_bankE[] = { "" };
+static uint16_t addresses_bankF[] = { 0xFFFF };
+static char *labels_bankF[] = { "" };

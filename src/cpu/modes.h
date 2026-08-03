@@ -162,7 +162,9 @@ static void aindl() { // [addr]    uint16_t eahelp, eahelp2;
 static void ind0() { // (zp)
     uint16_t eahelp;
     eahelp = (uint16_t)read6502(regs.pc++, regs.k);
-    ea = (uint16_t)read6502(direct_page_add(eahelp), 0) | ((uint16_t)read6502(direct_page_add(eahelp + 1), 0) << 8);
+    // 65816: the pointer lives in bank 0 (direct page), but the DATA access
+    // goes through DBR. With db=0 (the 6502 case) this is a no-op.
+    ea = addr_with_db((uint16_t)read6502(direct_page_add(eahelp), 0) | ((uint16_t)read6502(direct_page_add(eahelp + 1), 0) << 8));
 
     if (regs.dp & 0x00FF) {
         penaltyd = 1;
@@ -176,7 +178,8 @@ static void indl0() { // [dp]
 static void indx() { // (indirect,X)
     uint16_t eahelp;
     eahelp = (uint16_t)read6502(regs.pc++, regs.k) + regs.x;
-    ea = (uint16_t)read6502(direct_page_add(eahelp), 0) | ((uint16_t)read6502(direct_page_add(eahelp + 1), 0) << 8);
+    // 65816: data access through DBR (see ind0).
+    ea = addr_with_db((uint16_t)read6502(direct_page_add(eahelp), 0) | ((uint16_t)read6502(direct_page_add(eahelp + 1), 0) << 8));
 
     if (regs.dp & 0x00FF) {
         penaltyd = 1;
@@ -184,11 +187,14 @@ static void indx() { // (indirect,X)
 }
 
 static void indy() { // (indirect),Y
-    uint16_t eahelp, startpage;
+    uint16_t eahelp, ptr, startpage;
     eahelp = (uint16_t)read6502(regs.pc++, regs.k);
-    ea = (uint16_t)read6502(direct_page_add(eahelp), 0) | ((uint16_t)read6502(direct_page_add(eahelp + 1), 0) << 8);
-    startpage = ea & 0xFF00;
-    ea += regs.y;
+    ptr = (uint16_t)read6502(direct_page_add(eahelp), 0) | ((uint16_t)read6502(direct_page_add(eahelp + 1), 0) << 8);
+    startpage = ptr & 0xFF00;
+    // 65816: data at DBR:pointer + Y, and the +Y carries INTO the bank
+    // (a 24-bit add), unlike absolute wrapping. With db=0 and a 16-bit
+    // result this matches the old 6502 behavior.
+    ea = mask_long_addr(addr_with_db(ptr) + regs.y);
 
     if (regs.dp & 0x00FF) {
         penaltyd = 1;

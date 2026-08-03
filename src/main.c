@@ -1776,7 +1776,7 @@ emulator_loop(void *param)
 				printf(" ");
 			}
 			if (regs.is65c816) {
-				printf("C=$%04x X=$%04x Y=$%04x S=$%04x P=", regs.c, regs.x, regs.y, regs.sp);
+				printf("C=$%04x X=$%04x Y=$%04x S=$%04x B=%02x D=%04x P=", regs.c, regs.x, regs.y, regs.sp, regs.db, regs.dp);
 				for (int i = 7; i >= 0; i--) {
 					printf("%c", (regs.status & (1 << i)) ? "czidxmvn"[i] : '-');
 				}
