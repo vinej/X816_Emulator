@@ -52,7 +52,7 @@
 // made the larger space work -- ADDRX, L0/L1_BASEX, CTRL816.REGWIN, VRAMCAP,
 // the unpopulated-hole rule and the widened sprite attributes -- was removed
 // with it. The blitter (DCSEL=33) stayed and was narrowed to 17 bits; it is
-// the only non-stock register bank left. See the core's doc/VERA816.md.
+// the only non-stock register bank left (doc/BLIT816.md).
 #define VERA_VRAM_SIZE      0x20000   // 128 KB, fully populated
 #define VERA_ADDR_MASK      0x1FFFF   // 17-bit address space
 
@@ -1753,11 +1753,10 @@ fx_affine_prefetch(void)
 // Vera: Internal Video Address Space
 //
 
-// Maps a VERA816 address onto storage. The address space is 19 bits but only
-// 128 KB is fully populated and the address space is exactly 128 KB, so the
-// mask alone is the bound -- there is no unpopulated hole to model. (The
-// 352 KB configuration needed a sink byte here for the $58000-$7FFFF hole;
-// masking to a power of two makes that unnecessary.)
+// Maps a VRAM address onto storage. 128 KB, fully populated, and the address
+// space is exactly 128 KB -- so the mask alone is the bound, and there is no
+// unpopulated hole to model. (The removed 352 KB configuration needed a sink
+// byte here; masking to a power of two makes that unnecessary.)
 static inline uint8_t *
 vram_at(uint32_t address)
 {
@@ -1860,7 +1859,7 @@ blt_param_write(uint8_t value)
 }
 
 // BLT_CTRL start. The RTL engine consumes idle VRAM slots and takes real
-// time (~3-6 ms for a full frame); the emulator is PERMITTED by VERA816.md
+// time (~3-6 ms for a full frame); the emulator is PERMITTED by BLIT816.md
 // section 4.3 to complete the whole operation instantaneously, which is what
 // happens here: by the time the CPU can read BLT_CTRL, busy (bit 0) is 0
 // again, so polling loops still terminate on their first poll, and
