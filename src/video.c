@@ -44,14 +44,18 @@
 #define VERA_VERSION_PATCH  2
 
 #define ADDR_VRAM_START     0x00000
-// VERA816: 19-bit address space (512 KB), 352 KB populated.
-// See the core's doc/VERA816.md -- that document is the contract, and the
-// RTL implements the same numbers.
-#define VERA816_VRAM_SIZE   0x58000   // 352 KB populated
-#define VERA816_ADDR_MASK   0x7FFFF   // 19-bit address space
-#define VERA816_VRAMCAP     (VERA816_VRAM_SIZE / 0x4000)  // 22, in 16 KB units
+// Stock VERA: 17-bit address space, 128 KB, fully populated.
+//
+// 2026-08-02: this was a 19-bit / 352 KB space (the VERA816 extension) until
+// banks $01-$04 were given BRAM and VRAM went back to stock. Everything that
+// made the larger space work -- ADDRX, L0/L1_BASEX, CTRL816.REGWIN, VRAMCAP,
+// the unpopulated-hole rule and the widened sprite attributes -- was removed
+// with it. The blitter (DCSEL=33) stayed and was narrowed to 17 bits; it is
+// the only non-stock register bank left. See the core's doc/VERA816.md.
+#define VERA_VRAM_SIZE      0x20000   // 128 KB, fully populated
+#define VERA_ADDR_MASK      0x1FFFF   // 17-bit address space
 
-#define ADDR_VRAM_END       VERA816_VRAM_SIZE
+#define ADDR_VRAM_END       VERA_VRAM_SIZE
 #define ADDR_PSG_START      0x1F9C0
 #define ADDR_PSG_END        0x1FA00
 #define ADDR_PALETTE_START  0x1FA00
@@ -104,7 +108,7 @@ bool mouse_grabbed = false;
 bool no_keyboard_capture = false;
 bool kernal_mouse_enabled = false;
 
-static uint8_t video_ram[VERA816_VRAM_SIZE];
+static uint8_t video_ram[VERA_VRAM_SIZE];
 static uint8_t palette[256 * 2];
 static uint8_t sprite_data[128][8];
 
@@ -115,18 +119,8 @@ static uint8_t io_inc[2];
 static uint8_t io_addrsel;
 static uint8_t io_dcsel;
 
-// VERA816 extension bank, DCSEL=32. Stock VERA has no spare bits for two more
-// address bits, and $9F3D is not free (it is write-only AUDIO_DATA), so the
-// extensions live in an otherwise-unused DCSEL bank. DCSEL 0-1 are display
-// control, 2-6 are VERA FX and 63 is the version registers (DC_VER0-3), so 32
-// is used -- clear of both, with room either side.
-// All power up to 0, which makes VERA816 behave exactly like stock VERA until
-// software opts in. See the core's doc/VERA816.md section 4.
-#define VERA816_DCSEL 32
-static uint8_t vera816_basex[2];   // per layer: [1:0] MAPBASE[9:8], [3:2] TILEBASE[9:8]
-
-// VERA816 blitter bank, DCSEL=33 (doc/VERA816.md section 4.3, normative;
-// RTL: blit816.v + the DCSEL-33 decode in top.v):
+// Blitter bank, DCSEL=33 (doc/BLIT816.md, normative; RTL: blit816.v + the
+// DCSEL-33 decode in top.v):
 //   $9F29 BLT_IDX   R/W  index into the parameter file, 0-9
 //   $9F2A BLT_DATA  R/W  the indexed parameter byte; a WRITE auto-increments
 //                        BLT_IDX, a read does not
@@ -134,30 +128,16 @@ static uint8_t vera816_basex[2];   // per layer: [1:0] MAPBASE[9:8], [3:2] TILEB
 //                   R    bit 0 = busy
 //   $9F2C BLT_ID    R    $B6 -- feature detect (stock VERA reads the version
 //                        byte here)
-// Parameter file: 0-2 SRC, 3-5 DST, 6-8 LEN (19-bit little-endian, byte
-// addresses / byte count, [18:16] in the low bits of the third byte), 9 = the
+// Parameter file: 0-2 SRC, 3-5 DST, 6-8 LEN (17-bit little-endian, byte
+// addresses / byte count, bit 16 in the low bit of the third byte), 9 = the
 // FILL value.
-#define VERA816_BLT_DCSEL    33
-#define VERA816_BLT_ID_VALUE 0xB6
+#define VERA_BLT_DCSEL    33
+#define VERA_BLT_ID_VALUE 0xB6
 
-// VERA816 control bank, DCSEL=34 (doc/VERA816.md section 4.4):
-//   $9F29 CTRL816   R/W  bit 0 = REGWIN: 0 = the PSG/palette/sprite-attribute
-//                        windows sit at their stock $1F9C0-$1FFFF; 1 = they
-//                        decode at $7F9C0-$7FFFF instead (same [16:0]
-//                        offsets, top of the 512 KB space, inside the
-//                        unpopulated region), freeing the whole 352 KB as
-//                        plain VRAM. Bits [7:1] reserved, write 0, read 0.
-//   $9F2A-$9F2C     reserved (read the version bytes today; do not rely)
-// Relocated windows are WRITE-ONLY: stock readback was only ever the VRAM
-// shadow underneath the window, and there is no memory under the high
-// position, so reads there return $00 (the section 3 hole rule) -- which
-// vram_at() already implements.
-#define VERA816_CTRL_DCSEL   34
-static bool vera816_regwin_hi;
 static uint8_t  blt_idx;           // BLT_IDX; 4 bits, like top.v's blt_idx_r
-static uint32_t blt_src;           // 19-bit VRAM byte address
-static uint32_t blt_dst;           // 19-bit VRAM byte address
-static uint32_t blt_len;           // 19-bit byte count
+static uint32_t blt_src;           // 17-bit VRAM byte address
+static uint32_t blt_dst;           // 17-bit VRAM byte address
+static uint32_t blt_len;           // 17-bit byte count
 static uint8_t  blt_val;           // FILL byte
 
 static uint8_t ien;
@@ -278,9 +258,6 @@ video_reset()
 	memset(io_inc, 0, sizeof(io_inc));
 	io_addrsel = 0;
 	io_dcsel = 0;
-	vera816_basex[0] = 0;
-	vera816_basex[1] = 0;
-	vera816_regwin_hi = false;
 	blt_idx = 0;
 	blt_src = 0;
 	blt_dst = 0;
@@ -523,14 +500,8 @@ refresh_layer_properties(const uint8_t layer)
 	uint16_t prev_hscroll = props->hscroll;
 
 	props->color_depth    = reg_layer[layer][0] & 0x3;
-	// VERA816: MAPBASE and TILEBASE each gain two bits from the DCSEL=63
-	// extension bank, extending their reach from a 17-bit to a 19-bit space.
-	// Granularity is unchanged -- MAPBASE stays 512-byte aligned, TILEBASE
-	// 2048-byte aligned.
-	props->map_base       = (reg_layer[layer][1] << 9)
-	                      | ((uint32_t)(vera816_basex[layer] & 0x03) << 17);
-	props->tile_base      = ((reg_layer[layer][2] & 0xFC) << 9)
-	                      | ((uint32_t)((vera816_basex[layer] >> 2) & 0x03) << 17);
+	props->map_base       = reg_layer[layer][1] << 9;
+	props->tile_base      = (reg_layer[layer][2] & 0xFC) << 9;
 	props->bitmap_mode    = (reg_layer[layer][0] & 0x4) != 0;
 	props->text_mode      = (props->color_depth == 0) && !props->bitmap_mode;
 	props->text_mode_256c = (reg_layer[layer][0] & 8) != 0;
@@ -676,14 +647,8 @@ refresh_sprite_properties(const uint16_t sprite)
 	props->vflip = (sprite_data[sprite][6] >> 1) & 1;
 
 	props->color_mode     = (sprite_data[sprite][1] >> 7) & 1;
-	// VERA816 (doc/VERA816.md section 5.1, normative): sprite attribute
-	// byte 1 bits [5:4] -- formerly reserved, write-0 -- are VRAM byte
-	// address bits [18:17], so sprite data can live above 128 KB. Bit 6
-	// stays reserved. Granularity stays 32 bytes, and software that writes
-	// the reserved bits as zero sees exactly stock behaviour.
 	props->sprite_address = ((uint32_t)sprite_data[sprite][0] << 5)
-	                      | ((uint32_t)(sprite_data[sprite][1] & 0xf) << 13)
-	                      | ((uint32_t)((sprite_data[sprite][1] >> 4) & 0x3) << 17);
+	                      | ((uint32_t)(sprite_data[sprite][1] & 0xf) << 13);
 
 	props->palette_offset = (sprite_data[sprite][7] & 0x0f) << 4;
 }
@@ -766,13 +731,11 @@ render_sprite_line(const uint16_t y)
 		int16_t       eff_sx      = (props->hflip ? (props->sprite_width - 1) : 0);
 		const int16_t eff_sx_incr = props->hflip ? -1 : 1;
 
-		// VERA816: with the section 5.1 widening the sprite address is a
-		// 19-bit byte address, so a line's data can sit in -- or run into --
-		// the unpopulated $58000-$7FFFF region, which reads $00 and has no
-		// storage behind it (the backing array is only 352 KB). Fetch each
-		// byte through video_space_read instead of aiming a raw pointer into
-		// video_ram: that gives the hole its read-0 semantics and wraps the
-		// address modulo 512 KB like every other VRAM access.
+		// Fetch each byte through video_space_read rather than aiming a raw
+		// pointer into video_ram: a sprite line near the top of VRAM runs off
+		// the end of the array, and video_space_read masks the address like
+		// every other VRAM access. (Found while widening sprites to 19 bits;
+		// the widening was reverted, this out-of-bounds fix was not.)
 		const uint32_t line_addr = props->sprite_address + ((uint32_t)eff_sy << (props->sprite_width_log2 - (1 - props->color_mode)));
 
 		uint8_t bitmap_data[64];
@@ -1692,11 +1655,10 @@ get_and_inc_address(uint8_t sel, bool write)
 	}
 
 	io_addr[sel] += incr;
-	// VERA816: the address space is 19 bits and auto-increment wraps within
-	// it (doc/VERA816.md conformance test 4). Stock VERA masked only at
-	// access time, which let the register read back a value it could never
-	// address.
-	io_addr[sel] &= VERA816_ADDR_MASK;
+	// The address space is 17 bits and auto-increment wraps within it. Stock
+	// VERA masked only at access time, which let the register read back a
+	// value it could never address.
+	io_addr[sel] &= VERA_ADDR_MASK;
 
 	if (sel == 1 && fx_addr1_mode == 1) { // FX line draw mode
 		fx_x_pixel_position += fx_x_pixel_increment;
@@ -1774,22 +1736,14 @@ fx_affine_prefetch(void)
 //
 
 // Maps a VERA816 address onto storage. The address space is 19 bits but only
-// 352 KB is populated; $58000-$7FFFF has no memory behind it, and per
-// doc/VERA816.md reads there return $00 and writes are discarded, with no
-// mirroring (352 KB is not a power of two, so mirroring would need a modulo).
-// Routing the hole to a sink byte that is cleared on every access gives those
-// semantics uniformly, including for the read-modify-write FX paths.
-static uint8_t vram_hole_sink;
-
+// 128 KB is fully populated and the address space is exactly 128 KB, so the
+// mask alone is the bound -- there is no unpopulated hole to model. (The
+// 352 KB configuration needed a sink byte here for the $58000-$7FFFF hole;
+// masking to a power of two makes that unnecessary.)
 static inline uint8_t *
 vram_at(uint32_t address)
 {
-	address &= VERA816_ADDR_MASK;
-	if (address >= VERA816_VRAM_SIZE) {
-		vram_hole_sink = 0;
-		return &vram_hole_sink;
-	}
-	return &video_ram[address];
+	return &video_ram[address & VERA_ADDR_MASK];
 }
 
 uint8_t
@@ -1815,26 +1769,19 @@ video_space_read_range(uint8_t* dest, uint32_t address, uint32_t size)
 // such decode, on ib traffic in top.v, so the emulator must not grow two
 // that can disagree).
 //
-// VERA816 CTRL816.REGWIN (doc/VERA816.md section 4.4): with the bit set, the
-// windows decode at $7F9C0-$7FFFF instead of $1F9C0-$1FFFF -- same [16:0]
-// offsets, so only the range checks move ($1F9C0 + $60000). The register
-// index arithmetic is offset-invariant, and the callers' vram_at() write
-// self-discards for the relocated position (it is inside the unpopulated
-// hole), which is what makes the relocated windows write-only, exactly as on
-// the RTL. With the bit clear the stock ranges apply and the freed
-// $1F9C0-$1FFFF is plain VRAM, updated by the vram_at() write alone.
+// The windows sit at their stock $1F9C0-$1FFFF and do not move. (CTRL816's
+// REGWIN bit used to relocate them to $7F9C0 so a 640x480 framebuffer could
+// cover the stock position; it went with the 352 KB.)
 static void
 vera_window_write(uint32_t address, uint8_t value)
 {
-	uint32_t woff = vera816_regwin_hi ? 0x60000 : 0;
-
-	if (address >= ADDR_PSG_START + woff && address < ADDR_PSG_END + woff) {
+	if (address >= ADDR_PSG_START && address < ADDR_PSG_END) {
 		audio_render();
 		psg_writereg(address & 0x3f, value);
-	} else if (address >= ADDR_PALETTE_START + woff && address < ADDR_PALETTE_END + woff) {
+	} else if (address >= ADDR_PALETTE_START && address < ADDR_PALETTE_END) {
 		palette[address & 0x1ff] = value;
 		video_palette.dirty = true;
-	} else if (address >= ADDR_SPRDATA_START + woff && address < ADDR_SPRDATA_END + woff) {
+	} else if (address >= ADDR_SPRDATA_START && address < ADDR_SPRDATA_END) {
 		sprite_data[(address >> 3) & 0x7f][address & 0x7] = value;
 		refresh_sprite_properties((address >> 3) & 0x7f);
 	}
@@ -1848,25 +1795,25 @@ video_space_write(uint32_t address, uint8_t value)
 }
 
 //
-// VERA816 blitter engine (doc/VERA816.md section 4.3; RTL: blit816.v)
+// Blitter engine (doc/BLIT816.md; RTL: blit816.v)
 //
 
 // BLT_DATA read: the indexed parameter byte. Mirrors blit816.v's readback
-// mux exactly: the [18:16] bytes (indexes 2/5/8) read back with their top
-// five bits 0, and indexes 10-15 read $00.
+// mux exactly: the bit-16 bytes (indexes 2/5/8) read back with their top
+// seven bits 0, and indexes 10-15 read $00.
 static uint8_t
 blt_param_read(void)
 {
 	switch (blt_idx) {
 		case 0:  return blt_src & 0xff;
 		case 1:  return (blt_src >> 8) & 0xff;
-		case 2:  return (blt_src >> 16) & 0x07;
+		case 2:  return (blt_src >> 16) & 0x01;
 		case 3:  return blt_dst & 0xff;
 		case 4:  return (blt_dst >> 8) & 0xff;
-		case 5:  return (blt_dst >> 16) & 0x07;
+		case 5:  return (blt_dst >> 16) & 0x01;
 		case 6:  return blt_len & 0xff;
 		case 7:  return (blt_len >> 8) & 0xff;
-		case 8:  return (blt_len >> 16) & 0x07;
+		case 8:  return (blt_len >> 16) & 0x01;
 		case 9:  return blt_val;
 		default: return 0x00;
 	}
@@ -1880,15 +1827,15 @@ static void
 blt_param_write(uint8_t value)
 {
 	switch (blt_idx) {
-		case 0: blt_src = (blt_src & 0x7ff00) | value;                            break;
-		case 1: blt_src = (blt_src & 0x700ff) | ((uint32_t)value << 8);           break;
-		case 2: blt_src = (blt_src & 0x0ffff) | ((uint32_t)(value & 0x07) << 16); break;
-		case 3: blt_dst = (blt_dst & 0x7ff00) | value;                            break;
-		case 4: blt_dst = (blt_dst & 0x700ff) | ((uint32_t)value << 8);           break;
-		case 5: blt_dst = (blt_dst & 0x0ffff) | ((uint32_t)(value & 0x07) << 16); break;
-		case 6: blt_len = (blt_len & 0x7ff00) | value;                            break;
-		case 7: blt_len = (blt_len & 0x700ff) | ((uint32_t)value << 8);           break;
-		case 8: blt_len = (blt_len & 0x0ffff) | ((uint32_t)(value & 0x07) << 16); break;
+		case 0: blt_src = (blt_src & 0x1ff00) | value;                            break;
+		case 1: blt_src = (blt_src & 0x100ff) | ((uint32_t)value << 8);           break;
+		case 2: blt_src = (blt_src & 0x0ffff) | ((uint32_t)(value & 0x01) << 16); break;
+		case 3: blt_dst = (blt_dst & 0x1ff00) | value;                            break;
+		case 4: blt_dst = (blt_dst & 0x100ff) | ((uint32_t)value << 8);           break;
+		case 5: blt_dst = (blt_dst & 0x0ffff) | ((uint32_t)(value & 0x01) << 16); break;
+		case 6: blt_len = (blt_len & 0x1ff00) | value;                            break;
+		case 7: blt_len = (blt_len & 0x100ff) | ((uint32_t)value << 8);           break;
+		case 8: blt_len = (blt_len & 0x0ffff) | ((uint32_t)(value & 0x01) << 16); break;
 		case 9: blt_val = value;                                                  break;
 		default: break;
 	}
@@ -1918,7 +1865,7 @@ blt_start(bool fill)
 		// only on COPY).
 		while (blt_len != 0) {
 			*vram_at(blt_dst) = blt_val;
-			blt_dst = (blt_dst + 1) & VERA816_ADDR_MASK;   // wrap mod 512 KB
+			blt_dst = (blt_dst + 1) & VERA_ADDR_MASK;   // wrap mod 128 KB
 			blt_len--;
 		}
 	} else {
@@ -1927,10 +1874,10 @@ blt_start(bool fill)
 		// (DST = SRC + LEN) is disjoint and is the intended fast-fill
 		// pattern.
 		while (blt_len != 0) {
-			uint8_t v = *vram_at(blt_src);                 // hole reads 0
-			*vram_at(blt_dst) = v;                         // hole write discarded
-			blt_src = (blt_src + 1) & VERA816_ADDR_MASK;
-			blt_dst = (blt_dst + 1) & VERA816_ADDR_MASK;
+			uint8_t v = *vram_at(blt_src);
+			*vram_at(blt_dst) = v;
+			blt_src = (blt_src + 1) & VERA_ADDR_MASK;
+			blt_dst = (blt_dst + 1) & VERA_ADDR_MASK;
 			blt_len--;
 		}
 	}
@@ -2214,44 +2161,19 @@ uint8_t video_read(uint8_t reg, bool debugOn) {
 		case 0x0C: {
 			int i = reg - 0x09 + (io_dcsel << 2);
 
-			// VERA816 extension bank (doc/VERA816.md section 4.1). VRAMCAP
-			// reports populated VRAM in 16 KB units and reads 0 on stock
-			// VERA, so software can detect the extension.
-			if (io_dcsel == VERA816_DCSEL) {
-				switch (reg) {
-					// ADDRX is a live WINDOW onto ADDR0/ADDR1 bits 18:17, not a
-					// separate latch -- so it tracks auto-increment carry, and
-					// reading it after the address has advanced returns the
-					// current bits. The RTL gets this for free because the bits
-					// live in the address registers; here it has to be derived.
-					case 0x09: return (uint8_t)(((io_addr[0] >> 17) & 0x03)
-					                          | (((io_addr[1] >> 17) & 0x03) << 2));
-					case 0x0A: return vera816_basex[0];
-					case 0x0B: return vera816_basex[1];
-					case 0x0C: return VERA816_VRAMCAP;
-				}
-			}
-
-			// VERA816 blitter bank (doc/VERA816.md section 4.3). None of
-			// these reads has side effects -- BLT_DATA reads do NOT
+			// Blitter bank (doc/BLIT816.md). None of these reads has
+			// side effects -- BLT_DATA reads do NOT
 			// auto-increment BLT_IDX (only writes do) -- so debug reads take
 			// the same path.
-			if (io_dcsel == VERA816_BLT_DCSEL) {
+			if (io_dcsel == VERA_BLT_DCSEL) {
 				switch (reg) {
 					case 0x09: return blt_idx;              // BLT_IDX (4-bit; upper bits 0, as in top.v)
 					case 0x0A: return blt_param_read();     // BLT_DATA
 					case 0x0B: return 0x00;                 // BLT_CTRL: bit 0 = busy; the engine
 					                                        // completes instantaneously, so busy
 					                                        // always reads 0 (see blt_start)
-					case 0x0C: return VERA816_BLT_ID_VALUE; // BLT_ID = $B6, feature detect
+					case 0x0C: return VERA_BLT_ID_VALUE; // BLT_ID = $B6, feature detect
 				}
-			}
-
-			// VERA816 control bank (doc/VERA816.md section 4.4). Only $9F29
-			// is defined; $9F2A-$9F2C fall through to the version bytes,
-			// exactly as in top.v's read mux.
-			if (io_dcsel == VERA816_CTRL_DCSEL && reg == 0x09) {
-				return vera816_regwin_hi ? 0x01 : 0x00;    // CTRL816
 			}
 
 			if (debugOn) return video_get_dc_value(i);
@@ -2331,18 +2253,18 @@ void video_write(uint8_t reg, uint8_t value) {
 				fx_2bit_poking = true;
 				io_addr[1] = (io_addr[1] & 0x1fffc) | (value & 0x3);
 			} else {
-				io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x7ff00) | value;
+				io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x1ff00) | value;
 				if (fx_16bit_hop && io_addrsel == 1)
 					fx_16bit_hop_align = value & 3;
 			}
 			io_rddata[io_addrsel] = video_space_read(io_addr[io_addrsel]);
 			break;
 		case 0x01:
-			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x700ff) | (value << 8);
+			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x100ff) | (value << 8);
 			io_rddata[io_addrsel] = video_space_read(io_addr[io_addrsel]);
 			break;
 		case 0x02:
-			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x6ffff) | ((value & 0x1) << 16);
+			io_addr[io_addrsel] = (io_addr[io_addrsel] & 0x0ffff) | ((value & 0x1) << 16);
 			fx_nibble_bit[io_addrsel] = (value >> 1) & 0x1;
 			fx_nibble_incr[io_addrsel] = (value >> 2) & 0x1;
 			io_inc[io_addrsel]  = value >> 3;
@@ -2472,39 +2394,8 @@ void video_write(uint8_t reg, uint8_t value) {
 			video_step(MHZ, 0, true); // potential midline raster effect
 			int i = reg - 0x09 + (io_dcsel << 2);
 
-			// VERA816 extension bank (doc/VERA816.md section 4.1)
-			if (io_dcsel == VERA816_DCSEL) {
-				switch (reg) {
-					case 0x09:  // $9F29 ADDRX
-						// Re-apply to both address registers immediately, so
-						// the order of ADDRX vs ADDR_L/M/H writes does not
-						// matter to software.
-						io_addr[0] = (io_addr[0] & 0x1ffff) | ((uint32_t)(value & 0x03) << 17);
-						io_addr[1] = (io_addr[1] & 0x1ffff) | ((uint32_t)((value >> 2) & 0x03) << 17);
-						break;
-					// The layer's cached properties MUST be refreshed here.
-					// map_base and tile_base are computed once, in
-					// refresh_layer_properties, which is otherwise only
-					// reached from a write to $9F2D-$9F33 / $9F34-$9F3A. A
-					// program that sets MAPBASE/TILEBASE and then extends
-					// them with BASEX -- the natural order, and the one
-					// examples/vera/scanout.c uses -- would leave the cache
-					// holding the un-extended base, so the layer renders
-					// from the low 128 KB while the CPU port writes where it
-					// was told. The RTL has no such cache and was correct
-					// throughout; this was emulator-only, the mirror image
-					// of AUDIT.md H-3 and H-4.
-					case 0x0A: vera816_basex[0] = value & 0x0f;         // $9F2A L0_BASEX
-					           refresh_layer_properties(0); break;
-					case 0x0B: vera816_basex[1] = value & 0x0f;         // $9F2B L1_BASEX
-					           refresh_layer_properties(1); break;
-					case 0x0C: break;                                   // $9F2C VRAMCAP: read-only
-				}
-				return;
-			}
-
-			// VERA816 blitter bank (doc/VERA816.md section 4.3)
-			if (io_dcsel == VERA816_BLT_DCSEL) {
+			// Blitter bank (doc/BLIT816.md)
+			if (io_dcsel == VERA_BLT_DCSEL) {
 				switch (reg) {
 					case 0x09:                          // $9F29 BLT_IDX
 						blt_idx = value & 0x0f;         // top.v latches write_data[3:0]
@@ -2528,14 +2419,6 @@ void video_write(uint8_t reg, uint8_t value) {
 					case 0x0C: break;                   // $9F2C BLT_ID: read-only
 				}
 				return;
-			}
-
-			// VERA816 control bank (doc/VERA816.md section 4.4)
-			if (io_dcsel == VERA816_CTRL_DCSEL) {
-				if (reg == 0x09) {                  // $9F29 CTRL816
-					vera816_regwin_hi = (value & 0x01) != 0;
-				}
-				return;                             // $9F2A-$9F2C: reserved, ignored
 			}
 
 			if (i == 0) {
