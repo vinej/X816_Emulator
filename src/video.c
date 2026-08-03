@@ -11,6 +11,7 @@
 #include "video.h"
 #include "memory.h"
 #include "glue.h"
+#include "vera2.h"
 #include "debugger.h"
 #include "keyboard.h"
 #include "gif.h"
@@ -1238,6 +1239,20 @@ render_line(uint16_t y, float scan_pos_x)
 		}
 	}
 
+	// VERA2 composited over VERA (doc/VERA2.md). Default: the bitmap replaces
+	// the whole active display. With CTRL[3] passthru, VERA's OPAQUE pixels
+	// (col_line != 0 -- sprites, the mouse) show over the bitmap instead;
+	// col_line != 0 is the emulator's rendering of the RTL's vera_opaque.
+	if (vera2_active()) {
+		bool pass = vera2_passthru();
+		uint32_t* framebuffer4 = framebuffer4_begin;
+		for (uint16_t x = s_pos_x_p; x < s_pos_x; x++) {
+			if (!(pass && col_line[x] != 0))
+				*framebuffer4 = vera2_color_at(x, y);
+			framebuffer4++;
+		}
+	}
+
 	// NTSC overscan
 	if (out_mode == 2) {
 		uint32_t* framebuffer4 = framebuffer4_begin;
@@ -1293,6 +1308,7 @@ video_step(float mhz, float steps, bool midline)
 			if (!ntsc_mode) {
 				new_frame = true;
 				frame_count++;
+				vera2_frame_start();   // vsync: latch DISPBASE (VERA2.md 3.2)
 			}
 		}
 		if (!ntsc_mode) {
@@ -1325,6 +1341,7 @@ video_step(float mhz, float steps, bool midline)
 			if (ntsc_mode) {
 				new_frame = true;
 				frame_count++;
+				vera2_frame_start();   // vsync: latch DISPBASE (VERA2.md 3.2)
 			}
 		}
 		if (ntsc_scan_pos_y == SCAN_HEIGHT*2) {
@@ -1333,6 +1350,7 @@ video_step(float mhz, float steps, bool midline)
 			if (ntsc_mode) {
 				new_frame = true;
 				frame_count++;
+				vera2_frame_start();   // vsync: latch DISPBASE (VERA2.md 3.2)
 			}
 		}
 		if (ntsc_mode) {

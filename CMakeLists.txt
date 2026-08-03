@@ -174,6 +174,7 @@ set(X16_SOURCES
     src/cpu/fake6502.c
     src/memory.c
     src/disasm.c
+    src/vera2.c
     src/video.c
     src/i2c.c
     src/smc.c

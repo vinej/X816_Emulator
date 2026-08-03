@@ -30,6 +30,7 @@
 #include "vera_spi.h"
 #include "sdcard.h"
 #include "sdblock.h"
+#include "vera2.h"
 #include "ieee.h"
 #include "glue.h"
 #include "debugger.h"
@@ -101,6 +102,7 @@ uint16_t num_banks = 1;
 uint16_t num_ram_banks = 64; // 512 KB default
 
 bool log_video = false;
+bool has_vera2 = false;   // -vera2: the VERA2 bitmap layer master switch
 bool log_speed = false;
 bool log_keyboard = false;
 bool dump_cpu = false;
@@ -350,6 +352,7 @@ machine_reset()
 		via2_init();
 	}
 	video_reset();
+	vera2_reset();
 	mouse_state_init();
 	reset6502(regs.is65c816);
 	midi_serial_init();
@@ -406,6 +409,11 @@ usage()
 	printf("\n(C)2019, 2023 Michael Steil et al.\n");
 	printf("All rights reserved. License: 2-clause BSD\n\n");
 	printf("Usage: x16emu [option] ...\n\n");
+	printf("-vera2\n");
+	printf("\tEnable the VERA2 SDRAM bitmap layer ($9F60-$9F6F). Models the\n");
+	printf("\tMiSTer OSD switch: without this flag the registers still decode\n");
+	printf("\tbut $9F61 reads $00 and the layer never draws -- exactly the\n");
+	printf("\thardware with the switch Off. See X816_core/doc/VERA2.md.\n");
 	printf("-boot <boot.rom>\n");
 	printf("\tX816 boot overlay, exactly 256 bytes, mapped at $00:FF00-$00:FFFF\n");
 	printf("\tfor reads while SYSCTL[0] is set. Required: without it the CPU\n");
@@ -654,7 +662,10 @@ main(int argc, char **argv)
 	argv++;
 
 	while (argc > 0) {
-		if (!strcmp(argv[0], "-boot")) {
+		if (!strcmp(argv[0], "-vera2")) {
+			argc--; argv++;
+			has_vera2 = true;
+		} else if (!strcmp(argv[0], "-boot")) {
 			argc--;
 			argv++;
 			if (!argc || argv[0][0] == '-') {

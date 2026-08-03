@@ -28,6 +28,7 @@
 #include "via.h"
 #include "memory.h"
 #include "sdblock.h"
+#include "vera2.h"
 #include "video.h"
 #include "ymglue.h"
 #include "cpu/fake6502.h"
@@ -211,6 +212,10 @@ io_read(uint16_t address, bool debugOn)
 	} else if (address < 0x9f50) {                // $9F40-$9F4F  YM2151
 		if (!debugOn) audio_render();
 		return YM_read_status();
+	} else if (address >= 0x9f60 && address < 0x9f70) {
+		// $9F60-$9F6F  VERA2 (doc/VERA2.md). Decodes UNCONDITIONALLY, like the
+		// RTL: the -vera2 switch gates only the ID value and activation.
+		return vera2_read(address & 0xf, debugOn);
 	} else if (address >= X816_SYSCTL && address <= X816_SYSCTL_LAST) {
 		if ((address & 0xf) == 0) {               // $9F80  SYSCTL
 			return (sysctl_overlay ? X816_SYSCTL_OVERLAY : 0)
@@ -243,6 +248,8 @@ io_write(uint16_t address, uint8_t value)
 			audio_render();
 			YM_write_reg(addr_ym, value);
 		}
+	} else if (address >= 0x9f60 && address < 0x9f70) {
+		vera2_write(address & 0xf, value);        // $9F60-$9F6F  VERA2
 	} else if (address >= X816_SYSCTL && address <= X816_SYSCTL_LAST) {
 		if ((address & 0xf) == 0) {
 			sysctl_overlay = (value & X816_SYSCTL_OVERLAY) != 0;

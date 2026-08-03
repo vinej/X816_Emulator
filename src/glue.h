@@ -103,6 +103,10 @@ extern bool using_hostfs;
 extern uint8_t activity_led;
 extern bool nvram_dirty;
 extern uint8_t nvram[0x40];
+// VERA2 master switch (-vera2). Models the MiSTer OSD "VERA2 Bitmap Layer"
+// entry: registers always decode, but ID reads $B5 and the layer can only
+// activate when this is set. Default off, like the OSD default.
+extern bool has_vera2;
 
 extern uint8_t MHZ;
 
