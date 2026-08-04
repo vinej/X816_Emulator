@@ -153,6 +153,7 @@ uint16_t trace_address = 0;
 #endif
 
 int instruction_counter;
+int guest_exit_status = -1;
 SDL_RWops *prg_file;
 bool prg_finished_loading;
 int prg_override_start = -1;
@@ -1815,6 +1816,33 @@ emulator_loop(void *param)
 			continue;
 		}
 
+		{ // DEBUG: X816_PCWATCH=bank:addr[,bank:addr...] logs regs when PC hits an address
+			static int pcw_n = -1;
+			static uint32_t pcw[8];
+			static int pcw_hits = 0;
+			if (pcw_n == -1) {
+				pcw_n = 0;
+				const char *e = getenv("X816_PCWATCH");
+				while (e && *e && pcw_n < 8) {
+					unsigned b, a;
+					if (sscanf(e, "%x:%x", &b, &a) == 2)
+						pcw[pcw_n++] = ((uint32_t)b << 16) | a;
+					e = strchr(e, ',');
+					if (e) e++;
+				}
+			}
+			if (pcw_n > 0 && pcw_hits < 500) {
+				uint32_t here = ((uint32_t)regs.k << 16) | regs.pc;
+				for (int i = 0; i < pcw_n; i++)
+					if (pcw[i] == here) {
+						pcw_hits++;
+						fprintf(stderr, "PCW %02x:%04x A=%04x X=%04x Y=%04x S=%04x B=%02x P=%02x\n",
+						        regs.k, regs.pc, regs.c, regs.x, regs.y, regs.sp, regs.db, regs.status);
+						break;
+					}
+			}
+		}
+
 		instruction_counter += waiting ^ 0x1;
 
 		step6502();
@@ -1846,6 +1874,18 @@ emulator_loop(void *param)
 
 		midi_serial_step(clocks);
 
+		if (new_frame) { // DEBUG: X816_PCDUMP=<frame> dumps regs each frame from there on
+			static long dump_frame = -2, frame_no = 0;
+			if (dump_frame == -2) {
+				const char *e = getenv("X816_PCDUMP");
+				dump_frame = e ? atol(e) : -1;
+			}
+			frame_no++;
+			if (dump_frame >= 0 && frame_no >= dump_frame) {
+				fprintf(stderr, "F%ld PC=%02x:%04x A=%04x X=%04x Y=%04x S=%04x D=%04x B=%02x P=%02x\n",
+				        frame_no, regs.k, regs.pc, regs.c, regs.x, regs.y, regs.sp, regs.dp, regs.db, regs.status);
+			}
+		}
 		if (!headless && new_frame) {
 			if (nvram_dirty && nvram_path) {
 				SDL_RWops *f = SDL_RWFromFile(nvram_path, "wb");
@@ -1858,6 +1898,17 @@ emulator_loop(void *param)
 
 			if (!video_update()) {
 				break;
+			}
+
+			if (guest_exit_status >= 0) {
+				// $9FBC exit, deferred so the guest's final prints reach
+				// the recording. Two more frames: the latch also dropped
+				// warp mode, so the next full frame renders everything.
+				static int exit_countdown = 2;
+				if (--exit_countdown == 0) {
+					main_shutdown();
+					exit(guest_exit_status);
+				}
 			}
 
 			timing_update();

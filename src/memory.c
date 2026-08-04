@@ -300,6 +300,18 @@ read6502(uint16_t address, uint8_t bank)
 void
 write6502(uint16_t address, uint8_t bank, uint8_t value)
 {
+	{ // DEBUG: X816_WATCH=bank:start-end logs every write in the range with PC
+		static long armed = -2;
+		static unsigned wb, ws, we;
+		if (armed == -2) {
+			const char *e = getenv("X816_WATCH");
+			armed = (e && sscanf(e, "%x:%x-%x", &wb, &ws, &we) == 3) ? 1 : -1;
+		}
+		if (armed == 1 && bank == wb && address >= ws && address <= we) {
+			fprintf(stderr, "W %02x:%04x=%02x PC=%02x:%04x\n",
+			        bank, address, value, regs.k, regs.pc);
+		}
+	}
 	open_bus = value;
 
 	if (bank != 0) {                              // $01:0000-$FF:FFFF
@@ -422,9 +434,14 @@ emu_write(uint8_t reg, uint8_t value)
 			// Guest-requested exit, for test harnesses: a finished suite
 			// should not have to wait out the host's timeout. On hardware
 			// this address is open bus and the write does nothing.
+			// Deferred to the next frame boundary (main.c) so the last
+			// prints - a test failure message, typically - reach the GIF
+			// and the window before the process dies.
 			printf("Guest exit via $9FBC, status %d.\n", value);
-			main_shutdown();
-			exit(value);
+			guest_exit_status = value;
+			// Warp renders only one frame in 64; drop it so the frames
+			// between here and the deferred exit render in full.
+			warp_mode = false;
 			break;
 		default: printf("WARN: Invalid register %x\n", DEVICE_EMULATOR + reg);
 	}

@@ -93,6 +93,9 @@ extern void machine_paste(char *text, bool handle_free);
 extern void machine_toggle_warp();
 extern void init_audio();
 extern void main_shutdown();
+// $9FBC guest exit, latched by memory.c and honoured at the next frame
+// boundary by the main loop (-1 = no exit requested).
+extern int guest_exit_status;
 
 extern bool video_is_tilemap_address(int addr);
 extern bool video_is_tiledata_address(int addr);
