@@ -1,0 +1,6 @@
+C:/quartus/projects/X816_Emulator/build-trace/CMakeFiles/update_git_rev.dir
+C:/quartus/projects/X816_Emulator/build-trace/CMakeFiles/gen_cpu_tables.dir
+C:/quartus/projects/X816_Emulator/build-trace/CMakeFiles/x16emu.dir
+C:/quartus/projects/X816_Emulator/build-trace/CMakeFiles/makecart.dir
+C:/quartus/projects/X816_Emulator/build-trace/CMakeFiles/edit_cache.dir
+C:/quartus/projects/X816_Emulator/build-trace/CMakeFiles/rebuild_cache.dir

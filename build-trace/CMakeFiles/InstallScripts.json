@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/quartus/projects/X816_Emulator/build-trace/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

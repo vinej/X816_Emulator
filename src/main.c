@@ -1720,7 +1720,17 @@ emulator_loop(void *param)
 
 #ifdef TRACE
 		if (regs.pc == trace_address && trace_address != 0) {
-			trace_mode = true;
+			// X816_TRACE_SKIP=n arms the trace on the (n+1)-th hit
+			static long trace_skip = -2;
+			if (trace_skip == -2) {
+				const char *e = getenv("X816_TRACE_SKIP");
+				trace_skip = e ? atol(e) : 0;
+			}
+			if (trace_skip > 0) {
+				trace_skip--;
+			} else {
+				trace_mode = true;
+			}
 		}
 		if (trace_mode && !waiting) {
 			char *lst = lst_for_address(regs.pc);
@@ -1814,6 +1824,18 @@ emulator_loop(void *param)
 
 		if (handle_ieee_intercept()) {
 			continue;
+		}
+
+		{ // DEBUG: X816_TRACE_AT=<instruction count> arms -trace mid-run
+			static long trace_at = -2;
+			if (trace_at == -2) {
+				const char *e = getenv("X816_TRACE_AT");
+				trace_at = e ? atol(e) : -1;
+			}
+			if (trace_at >= 0 && instruction_counter >= trace_at) {
+				trace_mode = true;
+				trace_at = -1;
+			}
 		}
 
 		{ // DEBUG: X816_PCWATCH=bank:addr[,bank:addr...] logs regs when PC hits an address
