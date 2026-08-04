@@ -389,7 +389,8 @@ emu_recorder_set(gif_recorder_command_t command)
 // 4: save_on_exit               11: write: char to STDOUT / read: clock 24-31
 // 5: record_gif
 // 6: record_wav
-// 7: cmd key toggle
+// 7: cmd key toggle           12: write: EXIT the emulator, value = status
+//                                 (test harnesses; open bus on hardware)
 void
 emu_write(uint8_t reg, uint8_t value)
 {
@@ -417,6 +418,14 @@ emu_write(uint8_t reg, uint8_t value)
 			fflush(stdout);
 			break;
 		}
+		case 12:
+			// Guest-requested exit, for test harnesses: a finished suite
+			// should not have to wait out the host's timeout. On hardware
+			// this address is open bus and the write does nothing.
+			printf("Guest exit via $9FBC, status %d.\n", value);
+			main_shutdown();
+			exit(value);
+			break;
 		default: printf("WARN: Invalid register %x\n", DEVICE_EMULATOR + reg);
 	}
 }
