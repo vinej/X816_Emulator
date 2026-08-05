@@ -50,6 +50,13 @@ static bool    boot_rom_loaded = false;
 // reads until software clears it -- see boot/boot.s in the core repo.
 static bool sysctl_overlay = true;
 
+// SYSCTL bit 2, TURBO. Powers up CLEAR (8 MHz-average pacing on hardware).
+// The emulator stores and reads it back so software probing works, but does
+// NOT change its execution rate: the emulated speed is whatever -mhz says.
+// Run -mhz 12 to approximate turbo timing (12.5 is not representable; ~4%
+// slow). The ms timer below is wall-clock-correct at any -mhz either way.
+static bool sysctl_turbo = false;
+
 // The $9F90 millisecond timer's state. Declared up here so memory_reset can
 // clear it: in the RTL it is reset by cpu_reset_n like everything else, and a
 // clock that survived reset in one implementation but not the other would be
@@ -109,6 +116,7 @@ void
 memory_reset()
 {
 	sysctl_overlay = true;
+	sysctl_turbo = false;
 	open_bus = 0;
 	timer_ms = timer_div = timer_latch = 0;
 }
@@ -158,11 +166,17 @@ void memory_randomize_ram(bool value) { randomizeRAM = value; }
 // ---------------------------------------------------------------------------
 // Free-running millisecond timer, $9F90-$9F93 (little-endian).
 //
-// x816.sv counts cpu_clk cycles and divides by X816_TIMER_DIV, gated by
-// nothing -- not cpu_rdy, not a chip select -- because both VIAs stop dead
-// during an SD transfer (doc/AUDIT.md L-4) and VERA's VSYNC latch collapses a
-// multi-frame freeze into one tick. This mirrors that: the divider runs off
-// the same CPU-clock delta the rest of the main loop is driven by.
+// x816.sv divides the RAW 12.5 MHz domain clock by X816_TIMER_DIV, gated by
+// nothing -- not cpu_rdy, not the TURBO pacer, not a chip select -- because
+// both VIAs stop dead during an SD transfer (doc/AUDIT.md L-4) and VERA's
+// VSYNC latch collapses a multi-frame freeze into one tick. The tick is
+// therefore 1 kHz WALL CLOCK in both of SYSCTL[2]'s CPU speeds.
+//
+// This emulator counts EXECUTED cycles at the -mhz rate, which is a different
+// unit from the hardware's raw domain clock -- since TURBO the two are only
+// equal in turbo mode. So the divider here is NOT X816_TIMER_DIV; it is
+// "executed cycles per millisecond at the emulated speed", MHZ * 1000, which
+// keeps the tick at 1 kHz wall clock exactly like the hardware's.
 //
 // The LATCH is normative, not an optimisation. Reading the low byte at $9F90
 // captures bits 31:8, and $9F91-$9F93 return that capture -- so software must
@@ -174,9 +188,10 @@ void memory_randomize_ram(bool value) { randomizeRAM = value; }
 void
 timer_step(uint32_t clocks)
 {
+	const uint32_t clks_per_ms = (uint32_t)MHZ * 1000u;
 	timer_div += clocks;
-	while (timer_div >= X816_TIMER_DIV) {
-		timer_div -= X816_TIMER_DIV;
+	while (timer_div >= clks_per_ms) {
+		timer_div -= clks_per_ms;
 		timer_ms++;
 	}
 }
@@ -219,7 +234,8 @@ io_read(uint16_t address, bool debugOn)
 	} else if (address >= X816_SYSCTL && address <= X816_SYSCTL_LAST) {
 		if ((address & 0xf) == 0) {               // $9F80  SYSCTL
 			return (sysctl_overlay ? X816_SYSCTL_OVERLAY : 0)
-			     | (regs.e ? X816_SYSCTL_EMU : 0);
+			     | (regs.e ? X816_SYSCTL_EMU : 0)
+			     | (sysctl_turbo ? X816_SYSCTL_TURBO : 0);
 		}
 		return sdblock_read(address & 0xf, debugOn);  // $9F81-$9F8B  SD
 	} else if (address >= X816_TIMER && address <= X816_TIMER_LAST) {
@@ -253,6 +269,7 @@ io_write(uint16_t address, uint8_t value)
 	} else if (address >= X816_SYSCTL && address <= X816_SYSCTL_LAST) {
 		if ((address & 0xf) == 0) {
 			sysctl_overlay = (value & X816_SYSCTL_OVERLAY) != 0;
+			sysctl_turbo   = (value & X816_SYSCTL_TURBO) != 0;
 		} else {
 			sdblock_write(address & 0xf, value);     // $9F81-$9F8B  SD
 		}
